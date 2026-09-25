@@ -465,6 +465,7 @@ static void utf8ToW(const char *s, wchar_t *out, int cap)
 static wchar_t g_lastName[256];
 static wchar_t g_lastText[4096];
 static wchar_t g_lastAnnounced[4600];
+static bool    g_coverAnnounced = false;   // 启动「注意」声明只念一次
 static volatile LONG g_pollBusy = 0;
 
 // ------------------------------------------------ 选项（分歧） ----------------
@@ -657,11 +658,43 @@ static void PollDialogue(void)
 		"    }"
 		"  }"
 		"} catch(e) { __r = \"\"; }"
-		"return __r;";
+		// 启动时的「注意」声明画面是一张整屏图片（image/attention_cn.png），挂在
+		// SysCoverLayer 上，没有任何文本可读，所以由驱动层自己念一段固定说明。
+		"var __cv=\"0\";"
+		"try{var __pl=global.kag.getPrimaryLayerAt(960,540);"
+		"if(__pl!=void){var __pn=\"\"+__pl.name;if(__pn==\"SysCoverLayer\")__cv=\"1\";}}catch(z0){}"
+		"if(__r==\"\"){__r=\"~|~~|~~|~~|~~|~\";}"
+		"return __r + \"~|~\" + __cv;";
 	char *out = NULL;
 	ExecOnMainThread(kPoll, &out);
 	InterlockedExchange(&g_pollBusy, 0);
 	if(!out) return;
+
+	// 最后一节是「声明层是否盖住画面」；从**末尾**往回找，前面的字段就都还不受影响。
+	{
+		char *last = NULL;
+		for(char *q = out; (q = strstr(q, "~|~")) != NULL; q += 3) last = q;
+		if(last)
+		{
+			int cover = atoi(last + 3);
+			*last = 0;
+			if(cover)
+			{
+				if(!g_coverAnnounced)
+				{
+					g_coverAnnounced = true;
+					diag("cover announced\n");
+					SpeechSpeak(L"注意。本作品纯属虚构，登场人物、团体名、地名、设定等"
+					            L"全部为虚构，与现实毫无关联。本作品是柚子公司（YUZOSOFT）的著作，"
+					            L"未经许可禁止将本作品中的内容进行复制、修改、录音、租赁、发布、播出。"
+					            L"本作品中出现的所有角色年龄均已超过 18 周岁。按空格或回车继续。", true);
+				}
+				free(out);
+				return;
+			}
+			g_coverAnnounced = false;
+		}
+	}
 
 	char *sep = strstr(out, "~|~");
 	if(!sep) { free(out); return; }
@@ -754,21 +787,25 @@ static void PollDialogue(void)
 //
 // 纪律（同流水线 §7）：层名一个都不许猜 —— 全部来自上面的网格探针转储；
 // 别名表里没把握的层名就照念层名本身，绝不编一个中文词冒充。
-#define NAV_MAX_ITEMS 128
+#define NAV_MAX_ITEMS 256
+#define NAV_HIST_MAX  200
 #define NAV_LOGICAL_W 1920
 #define NAV_LOGICAL_H 1080
 #define NAV_GRID 40
 
 struct NavItem {
 	char    name[64];
-	wchar_t label[128];
-	int hx, hy;                    // 命中的逻辑坐标（点这里一定落在该图层上）
+	wchar_t label[512];            // 回忆正文一整句可能很长（见 FetchHistory）
+	int hx, hy;                    // 命中的逻辑坐标；-1 = 不可点击（回忆正文）
 	int left, top, w, h;
 	bool isChild;                  // 是不是容器层的子控件（存档槽这类）
 };
 
 static NavItem g_items[NAV_MAX_ITEMS];
 static int     g_itemCount = 0;
+static bool    g_isBacklog = false;   // 本次扫描是不是回忆（BACKLOG）界面
+static bool    g_isCover = false;     // 本次扫描是不是启动「注意」声明画面
+static int     g_histCount = 0;       // 本次扫描插到最前面的正文条数
 static bool    g_nav = false;
 static int     g_sel = 0;
 static int     g_slidePct = 50;   // 滑条类控件当前用左/右键点到的百分比
@@ -792,6 +829,10 @@ static bool Excluded(const char *name)
 	if(strncmp(name, "\xE8\xA1\xA8", 3) == 0) return true;                  // 表
 	if(strncmp(name, "\xE8\xA3\x8F", 3) == 0) return true;                  // 裏
 	if(strncmp(name, "\xE3\x83\x88", 3) == 0) return true;                  // ト
+	// KAG 的内部子层用「父层:子层」命名（TouchUiLayer:LeftArrow、
+	// 表メッセージレイヤ0:テキスト、ShowDateLayer:PassiveComp …）。它们不是控件，
+	// 却会因为父层被网格命中而作为 children 被列出来 —— ADV 里实测多出 3 个噪声项。
+	if(strchr(name, ':')) return true;
 
 	// 纯装饰层：不是控件，做成导航项只是噪声（设置界面实测）。
 	// 依据：设置界面 40 项转储里这几个的名字与 rect ——
@@ -804,6 +845,39 @@ static bool Excluded(const char *name)
 	if(_stricmp(name, "music_num_bg") == 0) return true;
 	if(_stricmp(name, "helptext") == 0) return true;
 	if(_stricmp(name, "helpbase") == 0) return true;   // 标题画面实测多出来的帮助底图
+
+	// 回忆（BACKLOG）界面实测转储：正文由 historyLayer.data 单独朗读（见 FetchHistory），
+	// 下面这些是滚动容器和装饰层，不是按钮。
+	if(_stricmp(name, "blockBaseLayer") == 0) return true;
+	if(_stricmp(name, "scroll") == 0) return true;
+	if(_stricmp(name, "block") == 0) return true;
+	if(_stricmp(name, "slrail") == 0) return true;
+	if(_stricmp(name, "caption") == 0) return true;    // 「CHAPTER 1-1」横幅
+	if(_stricmp(name, "caption2") == 0) return true;
+	if(_stricmp(name, "bar") == 0) return true;
+	// jump0..jump5 / vreplay0.. / vsave0.. 是「某一句」的位置相关按钮，按序号念无意义
+	if((_strnicmp(name, "jump", 4) == 0 || _strnicmp(name, "vreplay", 7) == 0 ||
+	    _strnicmp(name, "vsave", 5) == 0) && isdigit((unsigned char)name[strlen(name) - 1]))
+		return true;
+
+	// 设置/自定义按钮排列界面实测转储：标题横幅、角色立绘框、示例文本、色轮遮罩
+	if(_stricmp(name, "allagemask") == 0) return true;
+	if(_stricmp(name, "chv_view") == 0) return true;
+	if(_stricmp(name, "winsample") == 0) return true;
+	if(_stricmp(name, "speedsample") == 0) return true;
+	if(_stricmp(name, "head") == 0) return true;       // 「自定义按钮排列」横幅
+	if(_stricmp(name, "szopaccaps") == 0) return true; // 「尺寸 / 透明度」说明条
+	if(_stricmp(name, "icons_area") == 0) return true;
+
+	// 设置界面所有滑条都是「<名>（滑条本体）+ _rail（轨道）+ _val（数值框）+
+	// _num_bg（数值底图）」四个图层。轨道高 6px、底图是装饰，数值框只有 59x21，
+	// 真正能按左右方向键调整的是**滑条本体**，所以后三个一律不当控件。
+	{
+		size_t L = strlen(name);
+		if(L > 4 && _stricmp(name + L - 4, "_val") == 0) return true;
+		if(L > 8 && _stricmp(name + L - 8, "_num_bg") == 0) return true;
+		if(L > 5 && _stricmp(name + L - 5, "_rail") == 0) return true;
+	}
 	return false;
 }
 
@@ -896,33 +970,43 @@ static const NameAlias g_alias[] = {
 	// ---- 游戏内底部工具栏：探针实测的一批 48x48 图层
 	//      （鼠标不在底部时整条工具栏会滑走，所以进入导航前先把它唤醒）
 	{ "hold",      L"保持" },
-	{ "custom",    L"自定义" },
+	{ "custom",    L"自定义按钮排列" },
 	{ "save",      L"存档" },
 	{ "qsave",     L"快速存档" },
 	{ "qload",     L"快速读档" },
 	{ "option",    L"设置" },
-	{ "log",       L"回想（已读文本）" },      // 实点验证：打开 BACKLOG 面板
+	{ "log",       L"历史记录（回想）" },      // 实点验证：打开 BACKLOG 面板
 	{ "auto",      L"自动播放" },
 	{ "skip",      L"快进" },
-	{ "hide",      L"隐藏界面" },
-	{ "scnchart",  L"场景流程" },
-	{ "volchg",    L"音量" },
-	// ---- 读档/存档界面（tw 界面截图逐项核对；层名来自 20px 网格探针）
-	{ "copy",      L"複製存檔" },
-	{ "move",      L"替換存檔" },
-	{ "edit",      L"編輯註釋" },
-	{ "del",       L"刪除存檔" },
-	{ "thumbview", L"顯示縮圖" },
-	{ "edithold",  L"選中編輯按鈕" },
-	{ "title",     L"回到標題界面" },
-	{ "title2",    L"回到標題界面" },
-	{ "to_quick",  L"快速讀檔" },
-	{ "to_voice",  L"語音收藏夾" },
-	{ "slider",    L"捲動軸" },
-	{ "page_up1",  L"上一頁" },
-	{ "page_up10", L"往前十頁" },
-	{ "page_add",  L"下一頁" },
-	{ "page_end",  L"最後一頁" },
+	{ "hide",      L"隐藏对话框" },
+	{ "scnchart",  L"流程图" },
+	{ "volchg",    L"音量调整" },
+	// ---- 工具栏后半段：层名与设置界面「键盘」页的动作名一一对应，
+	//      中文文案直接取自那一页的实测截图（见下面键盘页注释）。
+	{ "prev",      L"跳到上一个选项" },
+	{ "prevscn",   L"跳到上一个场景" },
+	{ "backskip",  L"快进（后退）" },
+	{ "backone",   L"跳到上一句文本" },
+	{ "nextscn",   L"跳到下一个场景" },
+	{ "next",      L"跳到下一个选项" },
+	{ "vreplay",   L"语音重播" },
+	{ "vsave",     L"语音收藏" },
+	// ---- 读档/存档界面（界面截图逐项核对；层名来自网格探针）。文案统一简体 ----
+	{ "copy",      L"复制存档" },
+	{ "move",      L"替换存档" },
+	{ "edit",      L"编辑注释" },
+	{ "del",       L"删除存档" },
+	{ "thumbview", L"显示缩图" },
+	{ "edithold",  L"选中编辑按钮" },
+	{ "title",     L"回到标题界面" },
+	{ "title2",    L"回到标题界面" },
+	{ "to_quick",  L"快速读档" },
+	{ "to_voice",  L"语音收藏夹" },
+	{ "slider",    L"滚动条" },
+	{ "page_up1",  L"上一页" },
+	{ "page_up10", L"往前十页" },
+	{ "page_add",  L"下一页" },
+	{ "page_end",  L"最后一页" },
 	// ---- 设置界面（实机截图 shots\settings_map.png + 40 项探针转储逐项对照）
 	//      每个选项是**左右两个独立子控件**，两半各有名字，所以两半各有标签。
 	//      层名描述底层标志位、画面显示人话，两者有时相反：noeff_off（左，高亮）
@@ -960,12 +1044,249 @@ static const NameAlias g_alias[] = {
 	{ "facemode_on",  L"显示说话人表情：开" },
 	{ "facemode_off", L"显示说话人表情：关" },
 	{ "reset",     L"恢复默认设置" },
-	// ---- 回想 / 画廊等面板（探针里以独立图层出现）
-	{ "Return",    L"返回" },
-	{ "Flowchart", L"流程图" },
-	{ "back",      L"返回" },
+	// ---- 设置界面其余 7 个页签 ----
+	// 依据：逐页点页签后 dump_children 的全量子控件转储 + 逐页截图核对。
+	// 「开/关」类成对控件的层名后缀就是它设的标志值，已用实点验证：
+	//   点 afterskip_off → kag.afterskip 变 0；点 afterskip_on → 变 1。
+	// 「页面显示 1」
+	{ "readskip_on",  L"自动跳过已读文本：开" },
+	{ "readskip_off", L"自动跳过已读文本：关" },
+	{ "readjump_off", L"已读文本自动跳过方式：快进" },
+	{ "readjump_on",  L"已读文本自动跳过方式：跳转" },
+	{ "curmove_on",   L"自动移动鼠标指针：开" },
+	{ "curmove_off",  L"自动移动鼠标指针：关" },
+	{ "msmv_yes",     L"鼠标指针自动移动至：是" },
+	{ "msmv_no",      L"鼠标指针自动移动至：否" },
+	{ "curhide_none", L"自动隐藏鼠标指针：不隐藏" },
+	{ "curhide_5",    L"自动隐藏鼠标指针：5 秒" },
+	{ "curhide_10",   L"自动隐藏鼠标指针：10 秒" },
+	{ "curhide_20",   L"自动隐藏鼠标指针：20 秒" },
+	{ "filedclk_off", L"存档读档时的鼠标操作：单击" },
+	{ "filedclk_on",  L"存档读档时的鼠标操作：双击" },
+	{ "drama_on",     L"沉浸式体验：开" },
+	{ "drama_off",    L"沉浸式体验：关" },
+	{ "use_speech",   L"使用第三方朗读工具" },
+	{ "stopdeact_on", L"久未操作时的游戏状态：停止" },
+	{ "stopdeact_off",L"久未操作时的游戏状态：继续" },
+	{ "voicecut_on",  L"语音中断：开" },
+	{ "voicecut_off", L"语音中断：关" },
+	{ "flowshow_on",  L"流程图中显示未读章节：开" },
+	{ "flowshow_off", L"流程图中显示未读章节：关" },
+	// 「页面显示 2」
+	{ "gamespeed",    L"游戏进行速度（滑条）" },
+	{ "vspeedsync",   L"语音播放速度与游戏进行速度保持一致" },
+	{ "voicespeed",   L"语音播放速度（滑条）" },
+	{ "skipspeed",    L"快进速度调整（滑条）" },
+	{ "skipst_n",     L"快进方式：普通" },
+	{ "skipst_f",     L"快进方式：快速" },
+	{ "skipst_t",     L"快进方式：纯文字" },
+	{ "icpreview_on", L"缩略图显示：开" },
+	{ "icpreview_off",L"缩略图显示：关" },
+	{ "sysse",        L"系统语音选项：音效" },
+	{ "sysvoice",     L"系统语音选项：角色语音" },
+	{ "sysvovolume",  L"系统语音音量（滑条）" },
+	{ "sysvovolume_test", L"试听系统语音" },
+	// 「页面显示 3」
+	{ "textspeed",    L"文本显示速度（滑条）" },
+	{ "autospeed",    L"自动模式速度（滑条）" },
+	{ "automode_n",   L"自动模式类型：普通" },
+	{ "automode_s",   L"自动模式类型：快速" },
+	{ "automode_v",   L"自动模式类型：语音优先" },
+	{ "skipall",      L"未读文本快进：开" },
+	{ "skipread",     L"未读文本快进：关" },
+	{ "afterskip_on", L"选择项后快进是否解除：不解除" },
+	{ "afterskip_off",L"选择项后快进是否解除：解除" },
+	{ "afterauto_on", L"选择项后自动模式是否解除：不解除" },
+	{ "afterauto_off",L"选择项后自动模式是否解除：解除" },
+	{ "ctrl_force",   L"Ctrl 快进方式：快速" },
+	{ "ctrl_read",    L"Ctrl 快进方式：仅已读" },
+	{ "winopac",      L"对话框不透明度（滑条）" },
+	{ "fontselect",   L"字体选择" },
+	{ "color_win",    L"颜色设置：普通对话框" },
+	{ "color_owin",   L"颜色设置：视点变更时对话框" },
+	{ "color_text",   L"颜色设置：未读文字" },
+	{ "color_read",   L"颜色设置：已读文字" },
+	{ "hsv",          L"颜色选择器" },
+	{ "HSVColorPicker", L"颜色选择器" },
+	{ "hsv_reset",    L"颜色重置" },
+	// 「页面显示 4」
+	{ "wavevolume",   L"主音量（滑条）" },
+	{ "bgmvolume",    L"BGM 音量（滑条）" },
+	{ "downvolume",   L"BGM（角色说话时）音量（滑条）" },
+	{ "bgmdown",      L"角色说话时不降低 BGM 音量" },
+	{ "sevolume",     L"游戏音效（滑条）" },
+	{ "syssevolume",  L"系统音效（滑条）" },
+	{ "movievolume",  L"视频音量（滑条）" },
+	{ "voicevolume",  L"角色语音（滑条）" },
+	{ "bgvvolume",    L"背景语音（普通）（滑条）" },
+	{ "chv_on",       L"单独设置每个角色的语音：开" },
+	{ "chv_off",      L"单独设置每个角色的语音：关" },
+	{ "chv_test",     L"试听角色语音" },
+	{ "chvolume",     L"角色语音音量（滑条）" },
+	// 角色列表（截图逐格核对；ch0-ch5 左列、ch6-ch11 右列）
+	{ "ch0",  L"朝武 芳乃" },   { "ch1",  L"常陆 茉子" },
+	{ "ch2",  L"丛雨" },        { "ch3",  L"蕾娜·列支诺瑙尔" },
+	{ "ch4",  L"鞍马 小春" },   { "ch5",  L"马庭 芦花" },
+	{ "ch6",  L"驹川 美津叶" }, { "ch7",  L"鞍马 廉太郎" },
+	{ "ch8",  L"鞍马 玄十郎" }, { "ch9",  L"朝武 安晴" },
+	{ "ch10", L"其他女性" },    { "ch11", L"其他男性" },
+	// 系统语音的角色选项（截图逐格核对）
+	{ "sysvo0", L"系统语音角色：朝武 芳乃" },
+	{ "sysvo1", L"系统语音角色：常陆 茉子" },
+	{ "sysvo2", L"系统语音角色：丛雨" },
+	{ "sysvo3", L"系统语音角色：蕾娜" },
+	{ "sysvo4", L"系统语音角色：鞍马 小春" },
+	{ "sysvo5", L"系统语音角色：马庭 芦花" },
+	{ "sysvo6", L"系统语音角色：驹川 美津叶" },
+	{ "sysvo7", L"系统语音角色：鞍马 廉太郎" },
+	{ "sysvo8", L"系统语音角色：鞍马 玄十郎" },
+	{ "sysvornd", L"系统语音角色：随机" },
+	// 「页面显示 5」确认页：18 项全部是「xxx 时是否确认」的 开/关 对
+	{ "asksave_on",       L"存档时是否确认：开" },      { "asksave_off",       L"存档时是否确认：关" },
+	{ "askoverwrite_on",  L"覆盖存档时是否确认：开" },  { "askoverwrite_off",  L"覆盖存档时是否确认：关" },
+	{ "askload_on",       L"读档时是否确认：开" },      { "askload_off",       L"读档时是否确认：关" },
+	{ "askqsave_on",      L"快速存档时是否确认：开" },  { "askqsave_off",      L"快速存档时是否确认：关" },
+	{ "askqload_on",      L"快速读档时是否确认：开" },  { "askqload_off",      L"快速读档时是否确认：关" },
+	{ "asktitle_on",      L"回到标题界面或中断回想时是否确认：开" },
+	{ "asktitle_off",     L"回到标题界面或中断回想时是否确认：关" },
+	{ "askjump_on",       L"在历史记录窗口中跳转是否确认：开" },
+	{ "askjump_off",      L"在历史记录窗口中跳转是否确认：关" },
+	{ "askflow_on",       L"在流程图中是否确认：开" },  { "askflow_off",       L"在流程图中是否确认：关" },
+	{ "asknext_on",       L"跳到下一个选项时是否确认：开" },
+	{ "asknext_off",      L"跳到下一个选项时是否确认：关" },
+	{ "askbackto_on",     L"跳到上一个选项时是否确认：开" },
+	{ "askbackto_off",    L"跳到上一个选项时是否确认：关" },
+	{ "asknextscn_on",    L"跳到下一个场景时是否确认：开" },
+	{ "asknextscn_off",   L"跳到下一个场景时是否确认：关" },
+	{ "askprevscn_on",    L"跳到上一个场景时是否确认：开" },
+	{ "askprevscn_off",   L"跳到上一个场景时是否确认：关" },
+	{ "askinit_on",       L"初始化系统设置时是否确认：开" },
+	{ "askinit_off",      L"初始化系统设置时是否确认：关" },
+	{ "askinitstand_on",  L"初始化立绘鉴赏模式时是否确认：开" },
+	{ "askinitstand_off", L"初始化立绘鉴赏模式时是否确认：关" },
+	{ "askdelete_on",     L"删除存档时是否确认：开" },  { "askdelete_off",     L"删除存档时是否确认：关" },
+	{ "askmove_on",       L"替换存档时是否确认：开" },  { "askmove_off",       L"替换存档时是否确认：关" },
+	{ "askcopy_on",       L"复制存档时是否确认：开" },  { "askcopy_off",       L"复制存档时是否确认：关" },
+	{ "askexit_on",       L"结束游戏时是否确认：开" },  { "askexit_off",       L"结束游戏时是否确认：关" },
+	// ---- 自定义按钮排列（实机转储：panel 下 item0-19 排列条 / pad0-18 槽位 /
+	//      func0-19 按钮库 / 两条滑条 / 两个页签 / 两个勾选 / 底部三个按钮）----
+	// 图标与功能的对应关系**尚未确认**（游戏把清单存在 SystemConfig 的
+	// qmorder_<type> 里，实测这四个键都取不到值），所以按钮库只做位置说法，不编功能名。
+	{ "tab_window", L"窗口菜单（页签）" },
+	{ "tab_touch",  L"触控菜单（页签）" },
+	{ "menulink",   L"统一按钮排列" },
+	{ "qmlock",     L"始终显示窗口菜单" },
+	{ "entouch",    L"始终显示触控菜单" },
+	{ "sl_size",    L"按钮尺寸（滑条）" },
+	{ "sl_opac",    L"按钮透明度（滑条）" },
+	{ "revert",     L"取消更改" },
+	{ "ok",         L"回到游戏" },
+	{ "init",       L"恢复默认设置" },
+	{ "dsgesture",  L"关闭手势功能" },
+	// ---- 回忆（BACKLOG）界面（实机转储：caption_backlog 标题 + 右侧滚动控件）----
+	{ "caption_backlog", L"历史记录" },
+	{ "home",       L"回到最早一句" },
+	{ "pageup",     L"上一页" },
+	{ "pagedown",   L"下一页" },
+	{ "end",        L"跳到最新一句" },
+	// ---- 通用底部按钮（三个界面实测同名同义）。title / title2 见上面读档界面那段 ----
+	{ "back",       L"回到游戏" },
+	{ "Return",     L"返回" },
+	{ "Flowchart",  L"流程图" },
 };
 static const int g_aliasCount = (int)(sizeof(g_alias) / sizeof(g_alias[0]));
+
+// ---------------- 生成式别名 ----------------
+// 同一批动作名在三处出现，写法不同、中文一样：
+//   工具栏       裸名（save / log / pageup …）
+//   设置·键盘页  <动作>_key1、<动作>_key2（主键、副键）
+//   设置·鼠标页  cp_<动作>（手势可绑定的功能）
+// 文案取自逐页截图的实测对应：键盘页 24 个动作逐行对齐、鼠标页 20 格逐格对齐，
+// 两边给出的中文完全一致，所以只维护这一份，三种写法一次生成。
+// （特例：键盘页把 skip 那一行写成「快速模式」，这里统一念「快进」；想改可以用
+//   plugin\a11y_labels.ini 覆盖，比如 `skip_key1=快速模式 键位1`。）
+struct ActionLabel { const char *action; const wchar_t *caption; };
+static const ActionLabel g_actions[] = {
+	{ "save",     L"打开存档界面" },
+	{ "load",     L"打开读档界面" },
+	{ "qsave",    L"快速存档" },
+	{ "qload",    L"快速读档" },
+	{ "option",   L"打开系统设置" },
+	{ "screen",   L"窗口／全屏切换" },
+	{ "click",    L"下一句／确定" },
+	{ "auto",     L"自动模式" },
+	{ "skip",     L"快进" },
+	{ "ctrl",     L"Ctrl 快进" },
+	{ "nextscn",  L"跳到下一个场景" },
+	{ "next",     L"跳到下一个选项" },
+	{ "log",      L"打开历史记录" },
+	{ "pageup",   L"历史记录上一页" },
+	{ "pagedown", L"历史记录下一页" },
+	{ "backone",  L"跳到上一句文本" },
+	{ "backskip", L"快进" },
+	{ "prevscn",  L"跳到上一个场景" },
+	{ "prev",     L"跳到上一个选项" },
+	{ "scnchart", L"打开流程图" },
+	{ "title",    L"回到标题界面" },
+	{ "volume",   L"音量调整" },
+	{ "hide",     L"隐藏对话框" },
+	{ "vreplay",  L"语音重播" },
+	{ "vsave",    L"语音收藏" },
+	{ "full",     L"全屏" },
+	{ "min",      L"最小化" },
+	{ "none",     L"无" },
+};
+// 生成式表必须自己持有缓冲区（NameAlias 的两个字段是**指针**，指不到新建的表项）
+struct GenAlias { char name[64]; wchar_t label[128]; };
+static GenAlias g_genAlias[256];
+static int g_genAliasCount = 0;
+
+static void AddGen(const char *name, const wchar_t *label)
+{
+	if(g_genAliasCount >= (int)(sizeof(g_genAlias) / sizeof(g_genAlias[0]))) return;
+	strncpy_s(g_genAlias[g_genAliasCount].name, 64, name, _TRUNCATE);
+	wcsncpy_s(g_genAlias[g_genAliasCount].label, 128, label, _TRUNCATE);
+	g_genAliasCount++;
+}
+
+// 名字里的序号和文案里的序号**必须分开传**：层名从 0 开始（item0/gesture0），
+// 念出来的序号从 1 开始。一开始两者共用同一个 %d，结果生成的是 gesture1..gesture5
+// （gesture0 没被翻译，实测就这样漏了一个），item 的文案则成了「第 0 格」。
+static void AddGenFmt(const char *fmt, int nameIdx, const wchar_t *capFmt, int labelNum)
+{
+	char buf[64];
+	sprintf_s(buf, sizeof(buf), fmt, nameIdx);
+	wchar_t lab[128];
+	_snwprintf_s(lab, 128, _TRUNCATE, capFmt, labelNum);
+	AddGen(buf, lab);
+}
+
+static void BuildGeneratedAliases(void)
+{
+	g_genAliasCount = 0;
+	for(int i = 0; i < (int)(sizeof(g_actions) / sizeof(g_actions[0])); i++)
+	{
+		wchar_t lab[128];
+		char nm[64];
+		sprintf_s(nm, sizeof(nm), "%s_key1", g_actions[i].action);
+		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls 主键", g_actions[i].caption);
+		AddGen(nm, lab);
+		sprintf_s(nm, sizeof(nm), "%s_key2", g_actions[i].action);
+		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls 副键", g_actions[i].caption);
+		AddGen(nm, lab);
+		sprintf_s(nm, sizeof(nm), "cp_%s", g_actions[i].action);
+		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls（手势功能）", g_actions[i].caption);
+		AddGen(nm, lab);
+	}
+	// 自定义按钮排列：排列条 / 槽位 / 按钮库都只有位置，没有可靠的功能名
+	for(int i = 0; i < 20; i++) AddGenFmt("item%d", i, L"排列位第 %d 格", i + 1);
+	for(int i = 0; i < 19; i++) AddGenFmt("pad%d",  i, L"放置槽位第 %d 格", i + 1);
+	for(int i = 0; i < 20; i++) AddGenFmt("func%d", i, L"按钮库第 %d 格", i + 1);
+	// 设置·鼠标页的 5 个手势槽位
+	for(int i = 0; i < 5; i++) AddGenFmt("gesture%d", i, L"鼠标手势槽位 %d", i + 1);
+
+	diagf("gen alias: %d 条\n", g_genAliasCount);
+}
 
 // ---------------- 用户标签表（plugin\a11y_labels.ini）----------------
 // 格式： 每行 `层名=中文标签`，# 或 ; 开头是注释。ini 里的条目优先于内置表，
@@ -1032,7 +1353,120 @@ static void LabelOf(const char *name, wchar_t *out, int cap)
 			return;
 		}
 	}
+	for(int i = 0; i < g_genAliasCount; i++)
+	{
+		if(_stricmp(name, g_genAlias[i].name) == 0)
+		{
+			wcsncpy_s(out, cap, g_genAlias[i].label, _TRUNCATE);
+			return;
+		}
+	}
 	utf8ToW(name, out, cap);
+}
+
+// ---------------- 回忆（BACKLOG）正文 ----------------
+//
+// 【实测依据】历史记录界面（kag.historyLayer）上：
+//   · `historyLayer.data` 是一个 Array，实测 length=25，一条一句已读台词；
+//   · 每条 `data[i]` 上，`.text` 是**本地化后的中文**、`.plaintext` 是**日文原文**
+//     （实测 data[20].text=「竟然专门跑到这犬魂作祟的地方来看庆典……」、
+//      data[20].plaintext=「わざわざイヌツキの土地に祭りを見に来たなんて……」，
+//      与截图上那 5 行完全一致）。
+//   · 界面上那 5 个正文块层的 `blockInfo.text` **只有日文**，所以正文一律走 data，
+//     不走 blockBaseLayer 的子层 —— 那条路是死路，已实测否掉。
+//   · 选项行会让 .text/.plaintext 语义对调，所以沿用当前台词那条**假名判据**来挑。
+static const char *kHistScript =
+	"var r=\"\";"
+	"try{"
+	"  var __d=global.kag.historyLayer.data;"
+	"  var __all=__d.length;"
+	"  var __st=0;var __n=__all;"
+	"  if(__n>200){__st=__n-200;__n=200;}"
+	"  r=\"\"+__n+\"\\x01\"+__st+\"\\x01\"+__all+\"\\x01\";"
+	"  for(var __i=0;__i<__n;__i++){"
+	"    var __e=void;try{__e=__d[__st+__i];}catch(h0){continue;}"
+	"    if(__e==void)continue;"
+	"    var __nm=\"\";var __tx=\"\";var __ot=\"\";"
+	// 说话人一律读 .disp：实测同一条 data[i] 上 name=運転手（原文）、disp=司机（译文）
+	"    try{__nm=\"\"+__e.disp;}catch(h1){}"
+	"    if(__nm==\"\"){try{__nm=\"\"+__e.name;}catch(h1b){}}"
+	"    try{__tx=\"\"+__e.text;}catch(h2){__tx=\"\";}"
+	"    try{__ot=\"\"+__e.plaintext;}catch(h3){__ot=\"\";}"
+	"    r+=__nm+\"\\x01\"+__tx+\"\\x01\"+__ot+\"\\x02\";"
+	"  }"
+	"}catch(e){r=\"\";}"
+	"return r;";
+
+static NavItem g_histBuf[NAV_HIST_MAX];
+
+// 返回读到的条数；每条的 label 直接就是「第 N 句 说话人：正文」。
+static int  g_histTotal = 0;
+static int FetchHistory(int cap)
+{
+	if(cap > NAV_HIST_MAX) cap = NAV_HIST_MAX;
+	char *res = NULL;
+	ExecOnMainThread(kHistScript, &res);
+	if(!res) return 0;
+	char *p = res;
+	int n = atoi(p);
+	p = strchr(p, '\x01');            // n
+	if(!p) { free(res); return 0; }
+	int start = atoi(p + 1);
+	p = strchr(p + 1, '\x01');        // start
+	if(!p) { free(res); return 0; }
+	int all = atoi(p + 1);
+	p = strchr(p + 1, '\x01');        // all
+	if(!p) { free(res); return 0; }
+	p++;
+	g_histTotal = all;
+
+	int made = 0;
+	for(int i = 0; i < n && made < cap; i++)
+	{
+		char *end = strchr(p, '\x02');
+		if(!end) break;
+		*end = 0;
+		char *s1 = strchr(p, '\x01');
+		if(s1)
+		{
+			*s1 = 0;
+			char *s2 = strchr(s1 + 1, '\x01');
+			if(s2)
+			{
+				*s2 = 0;
+				wchar_t wnm[256], wtx[512], wpl[512];
+				utf8ToW(p, wnm, 256);
+				utf8ToW(s1 + 1, wtx, 512);
+				utf8ToW(s2 + 1, wpl, 512);
+				const wchar_t *chosen = wtx;
+				if(wpl[0])
+				{
+					bool tk = HasKana(wtx), pk = HasKana(wpl);
+					if(!wtx[0] || (tk && !pk)) chosen = wpl;
+				}
+				size_t tl = wcslen(chosen);
+				while(tl > 0 && (chosen[tl-1] == L'\n' || chosen[tl-1] == L'\r' ||
+				                 chosen[tl-1] == L' '  || chosen[tl-1] == L'\u3000')) tl--;
+				if(tl > 0)
+				{
+					NavItem *it = &g_histBuf[made];
+					sprintf_s(it->name, sizeof(it->name), "~hist%d", made);
+					wchar_t line[512];
+					wcsncpy_s(line, 512, chosen, _TRUNCATE);
+					line[tl] = 0;
+					if(wnm[0]) _snwprintf_s(it->label, 512, _TRUNCATE, L"第 %d 句 %ls：%ls", start + i + 1, wnm, line);
+					else       _snwprintf_s(it->label, 512, _TRUNCATE, L"第 %d 句 %ls", start + i + 1, line);
+					it->hx = -1; it->hy = -1;
+					it->left = made; it->top = made; it->w = 0; it->h = 0;
+					it->isChild = false;
+					made++;
+				}
+			}
+		}
+		p = end + 1;
+	}
+	free(res);
+	return made;
 }
 
 static bool IsSaveOrLoadScreen(void)
@@ -1049,6 +1483,9 @@ static bool IsSaveOrLoadScreen(void)
 static void ScanItems(void)
 {
 	g_itemCount = 0;
+	g_isBacklog = false;
+	g_isCover = false;
+	g_histCount = 0;
 	char *out = NULL;
 	ExecOnMainThread(kScanScript, &out);
 	if(!out) { diag("scan: 探针脚本没有返回\n"); return; }
@@ -1085,6 +1522,9 @@ static void ScanItems(void)
 				{
 					int x = (int)(dx + 0.5), y = (int)(dy + 0.5);
 					int w = (int)(dw + 0.5), h = (int)(dh + 0.5);
+					if(_stricmp(nm, "blockBaseLayer") == 0 ||
+					   _stricmp(nm, "caption_backlog") == 0) g_isBacklog = true;
+					if(_stricmp(nm, "SysCoverLayer") == 0) g_isCover = true;
 					if(!Excluded(nm))
 					{
 						NavItem *it = &g_items[g_itemCount];
@@ -1152,6 +1592,55 @@ static void ScanItems(void)
 		g_items[b + 1] = key;
 	}
 
+	// 同一块地方同时被「容器子控件」和「网格叶子」命中时只留子控件。
+	// 实测：设置界面底部 1351,992 既被网格叶子 title2 命中、又是子控件 back
+	// （同一 rect），两个都收会连着念两遍「回到游戏」。
+	{
+		int keep = 0;
+		for(int i = 0; i < g_itemCount; i++)
+		{
+			bool dup = false;
+			if(!g_items[i].isChild)
+			{
+				for(int j = 0; j < g_itemCount; j++)
+				{
+					if(j == i || !g_items[j].isChild) continue;
+					if(g_items[j].left == g_items[i].left && g_items[j].top == g_items[i].top &&
+					   g_items[j].w == g_items[i].w && g_items[j].h == g_items[i].h) { dup = true; break; }
+				}
+			}
+			if(!dup) g_items[keep++] = g_items[i];
+		}
+		g_itemCount = keep;
+	}
+
+	// 启动「注意」声明：整屏只有一张图，不是控件，所以补一个「整屏可点」的项，
+	// 让回车/空格能把它关掉（真键盘的空格本来也能关，这里只是给导航模式一个出口）。
+	if(g_isCover && g_itemCount < NAV_MAX_ITEMS)
+	{
+		NavItem *it = &g_items[g_itemCount++];
+		strncpy_s(it->name, sizeof(it->name), "SysCoverLayer", _TRUNCATE);
+		wcsncpy_s(it->label, 512, L"注意声明（按回车关闭）", _TRUNCATE);
+		it->hx = 960; it->hy = 540;
+		it->left = 0; it->top = 0; it->w = NAV_LOGICAL_W; it->h = NAV_LOGICAL_H;
+		it->isChild = false;
+	}
+
+	// 回忆界面：正文放最前面（先念内容再念按钮）。
+	// 正文条数可能上百，所以先把已有控件整体后移，再往前面填。
+	if(g_isBacklog && g_itemCount < NAV_MAX_ITEMS)
+	{
+		int hn = FetchHistory(NAV_MAX_ITEMS - g_itemCount);
+		if(hn > 0)
+		{
+			for(int i = g_itemCount - 1; i >= 0; i--) g_items[i + hn] = g_items[i];
+			for(int i = 0; i < hn; i++) g_items[i] = g_histBuf[i];
+			g_itemCount += hn;
+			g_histCount = hn;
+			diagf("history: %d 句（共 %d 句）\n", hn, g_histTotal);
+		}
+	}
+
 	diagf("scan: %d 个控件\n", g_itemCount);
 }
 
@@ -1189,8 +1678,8 @@ static void NavAnnounce(const wchar_t *prefix)
 	if(g_sel < 0) g_sel = 0;
 	if(g_sel >= g_itemCount) g_sel = g_itemCount - 1;
 	g_slidePct = 50;   // 换了控件，滑条百分比从头开始
-	wchar_t say[512];
-	_snwprintf_s(say, 512, _TRUNCATE, L"%ls%ls。%d / %d",
+	wchar_t say[1024];
+	_snwprintf_s(say, 1024, _TRUNCATE, L"%ls%ls。%d / %d",
 		prefix ? prefix : L"", g_items[g_sel].label, g_sel + 1, g_itemCount);
 	SpeechSpeak(say, true);
 }
@@ -1223,8 +1712,16 @@ static void NavActivate(void)
 {
 	if(g_itemCount == 0) { NavExit(false); return; }
 	NavItem *it = &g_items[g_sel];
-	wchar_t say[256];
-	_snwprintf_s(say, 256, _TRUNCATE, L"已激活 %ls", it->label);
+	// 回忆正文不可点击（hx<0）：回车＝重念这一句。绝不能发鼠标事件 ——
+	// 消息窗那一片底下就是「推进剧情」的命中区，点下去会把剧情推走。
+	if(it->hx < 0)
+	{
+		diag("activate(hist) "); diagW(it->label);
+		SpeechSpeak(it->label, true);
+		return;
+	}
+	wchar_t say[600];
+	_snwprintf_s(say, 600, _TRUNCATE, L"已激活 %ls", it->label);
 	SpeechSpeak(say, true);
 	diag("activate "); diagW(it->label);
 	ClickLogical(it->hx, it->hy);
@@ -1307,8 +1804,16 @@ static void SkipTick(void)
 	(void)now;
 }
 
-// 设置页里实测到的两条滑条（层名来自探针转储）：点左右两端就是设值
-static const char *g_sliderNames[] = { "chaphidetime", "mushidetime" };
+// 设置页里实测到的滑条（层名来自逐页探针转储）：点左右两端的百分比位置就是设值。
+// 全部是横向滑条（426x35 或 282x34），所以「left + w*百分比」这个算法通用。
+static const char *g_sliderNames[] = {
+	"chaphidetime", "mushidetime",                              // 画面显示页
+	"gamespeed", "voicespeed", "skipspeed",                     // 游戏设置 2
+	"textspeed", "autospeed", "winopac",                        // 文本
+	"wavevolume", "bgmvolume", "downvolume", "sevolume",        // 音频
+	"syssevolume", "movievolume", "voicevolume", "bgvvolume",
+	"chvolume", "sysvovolume",
+};
 
 static bool IsSlider(const char *n)
 {
@@ -1485,6 +1990,9 @@ static void NavTick(void)
 		//   激活后没变化   → 不出声（免得每点一下都念一遍）
 		if(g_scanOnEnter)
 		{
+			// 回忆界面：进来时停在**最新一句**上（正文按时间从旧到新排，
+			// 停在第一条会让盲人从几十句之前开始听）
+			if(g_isBacklog && g_histCount > 0) g_sel = g_histCount - 1;
 			wchar_t pfx[64];
 			_snwprintf_s(pfx, 64, _TRUNCATE, L"导航模式，共 %d 项，", g_itemCount);
 			g_scanOnEnter = false;
@@ -1581,6 +2089,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 	diag("exeDir="); diagW(g_exeDir);
 	diag("== a11y6 build: CtrlFastForward + selectShowing + digit-choice ==\n");
 	LoadUserLabels();
+	BuildGeneratedAliases();
 
 	iTVPFunctionExporter *exp = (iTVPFunctionExporter *)exporterptr;
 	if(!exp) { diag("no exporter\n"); return E_FAIL; }
