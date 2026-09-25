@@ -610,12 +610,14 @@ static void BuildChoiceLabels(const wchar_t *summary)
 // 不保证与官方用词一致。想改不用重编译，往 plugin\a11y_labels.ini 里覆盖即可。
 enum { LANG_JP = 0, LANG_EN, LANG_CN, LANG_TW };
 static int g_lang = LANG_CN;
+static const char *g_langTag = "cn";   // DetectLanguage() 里填；也用来找 a11y_labels_<tag>.ini
 
 enum {
 	P_NAV_ENTER, P_NAV_EXIT, P_NAV_ON, P_UPDATED, P_ACTIVATED, P_NOITEM,
 	P_SLOT, P_EMPTY, P_LINE, P_CHOICES, P_PRESS_DIGIT, P_SELECTED, P_PAGE,
 	P_SKIP_START, P_SKIP_END, P_SKIP_STUCK, P_SKIP_NOTADV, P_SKIP_NONAV, P_SKIP_NOTEXT,
 	P_SLIDER_NO, P_SLIDER_PCT, P_NO_WINDOW, P_NOTICE, P_NOTHING_READ, P_LOADED,
+	P_KEY1, P_KEY2, P_GESTURE,
 	P_COUNT
 };
 
@@ -665,6 +667,9 @@ static const UiPhrase g_phrases[P_COUNT] = {
 		L"按空格或 Enter 繼續。" },
 	/* P_NOTHING_READ  */ { L"まだ何も読み上げていません。", L"Nothing has been read yet.", L"还没有朗读过内容。", L"還沒有朗讀過內容。" },
 	/* P_LOADED        */ { L"アクセシビリティモジュールを読み込みました。音声バックエンド %s", L"Accessibility module loaded. Speech backend: %s", L"无障碍模块已加载，语音后端 %s", L"無障礙模組已載入，語音後端 %s" },
+	/* P_KEY1          */ { L"主キー", L"primary key", L"主键", L"主鍵" },
+	/* P_KEY2          */ { L"副キー", L"secondary key", L"副键", L"副鍵" },
+	/* P_GESTURE       */ { L"（ジェスチャー機能）", L" (gesture)", L"（手势功能）", L"（手勢功能）" },
 };
 
 static const wchar_t *Ph(int id)
@@ -681,17 +686,158 @@ static const wchar_t *Ph(int id)
 }
 
 // 读一次游戏当前语言标签。必须在函数指针解析之后调用（见 V2Link 里 DetectLanguage()）。
+//
+// 【实测·三套语言】游戏有三套彼此独立的语言设置（菜单「テキスト言語」里能直接看到）：
+//   · 主要语言 [メイン]  = global.CurrentLanguageTag / kag.languageType   → 剧情正文
+//   · 字幕语言 [サブ]    = SystemConfig.subLanguageType（-1 = なし）      → 剧情第二语言
+//   · 界面语言           = global.CurrentLanguageUITag / uiLanguageType   → 菜单栏・界面图片・控件
+// 实测证据：Main=簡体中国語、Sub=なし 的同时 uitag=jp，而标题菜单念的是
+// 「はじめから／つづきから」、原生菜单栏是「ファイル(&F)／セーブ(F2)」——
+// **控件跟的是界面语言，不是主要语言**。所以这里取 CurrentLanguageUITag。
+// （0.0.4 曾误用 CurrentLanguageTag，结果界面切成英文时插件仍念中文标签。）
 static void DetectLanguage(void)
 {
 	char *out = NULL;
-	ExecOnMainThread("var r=\"cn\";try{r=\"\"+global.CurrentLanguageTag;}catch(e){}return r;", &out);
+	ExecOnMainThread(
+		"var r=\"cn\";try{var u=\"\"+global.CurrentLanguageUITag;"
+		"if(u==\"\"||u==\"undefined\"||u==\"null\"){u=\"\"+global.CurrentLanguageTag;}"
+		"if(u!=\"\"&&u!=\"undefined\"&&u!=\"null\")r=u;}catch(e){}return r;", &out);
 	if(!out) return;
-	if(strncmp(out, "jp", 2) == 0)      g_lang = LANG_JP;
-	else if(strncmp(out, "en", 2) == 0) g_lang = LANG_EN;
-	else if(strncmp(out, "tw", 2) == 0) g_lang = LANG_TW;
-	else                                g_lang = LANG_CN;
-	diagf("language tag=%s\n", out);
+	const char *prev = g_langTag;
+	if(strncmp(out, "jp", 2) == 0)      { g_lang = LANG_JP; g_langTag = "jp"; }
+	else if(strncmp(out, "en", 2) == 0) { g_lang = LANG_EN; g_langTag = "en"; }
+	else if(strncmp(out, "tw", 2) == 0) { g_lang = LANG_TW; g_langTag = "tw"; }
+	else                                { g_lang = LANG_CN; g_langTag = "cn"; }
+	if(_stricmp(prev, g_langTag) != 0) diagf("language tag=%s\n", out);   // 只在变化时记，免得刷屏
 	free(out);
+}
+
+// ---------------- 动作名：直接读游戏原生菜单栏的 caption ----------------
+//
+// 【实测】Title 右上角那个 `Language:` 按钮设的是**界面语言**，一改，
+// `global.kag.menu`（原生 Win32 菜单栏）的 caption **立刻**跟着变，而且四语齐全：
+//     uitag=jp → セーブ(F2) / バックログ(&L) / [メイン] 日本語(&J)
+//     uitag=en → &Save(F2) / Back&log       / [Main] &Japanese
+//     uitag=tw → 保存進度(F2) / 歷史記錄(&L) / [主要] 日語(&J)
+// 所以工具栏那一批动作名**不需要任何数据文件**：直接问游戏要，
+// 永远是它自己的用词、永远跟着界面语言走。（繁体也因此不用自己做简繁转换 ——
+// 转换会把「游戲」转成「游戲」，游戏自己给的是「保存進度」这种正确说法。）
+//
+// 索引是实机枚举出来的（2026-09 实测，ver1.12）：
+//   children[1] = ファイル / [2] = 画面 / [3] = 進行制御 / [7] = テキスト言語
+struct MenuLabel { char layer[32]; wchar_t text[128]; };
+static MenuLabel g_menuLabels[64];
+static int g_menuLabelCount = 0;
+
+static const wchar_t *MenuLabelFor(const char *layer)
+{
+	for(int i = 0; i < g_menuLabelCount; i++)
+		if(_stricmp(g_menuLabels[i].layer, layer) == 0) return g_menuLabels[i].text;
+	return NULL;
+}
+
+// 菜单 caption 带加速键与快捷键括注（`終了(&X)`、`セーブ(F2)`、`Back&log`），
+// 念的时候要把这些去掉。
+static void CleanMenuCaption(const wchar_t *in, wchar_t *out, int cap)
+{
+	wchar_t tmp[256];
+	wcsncpy_s(tmp, 256, in, _TRUNCATE);
+	wchar_t *p = tmp;
+	for(wchar_t *q = tmp; *q; q++) if(*q != L'&') *p++ = *q;   // 去掉 &
+	*p = 0;
+	size_t n = wcslen(tmp);
+	while(n > 0 && (tmp[n-1] == L' ' || tmp[n-1] == L'\t')) tmp[--n] = 0;
+	if(n >= 3 && wcscmp(tmp + n - 3, L"...") == 0) { tmp[n-3] = 0; }
+	else if(n >= 2 && tmp[n-1] == L')')
+	{
+		wchar_t *lp = wcsrchr(tmp, L'(');
+		if(lp && lp != tmp) *lp = 0;
+	}
+	n = wcslen(tmp);
+	while(n > 0 && (tmp[n-1] == L' ' || tmp[n-1] == L'\t')) tmp[--n] = 0;
+	wcsncpy_s(out, cap, tmp, _TRUNCATE);
+}
+
+// (菜单下标, 项下标, 层名) 的对应表在 kMenuScript 里（TJS 侧那份是唯一真源，
+// 免得两边各抄一份抄出分歧）。对照关系（ver1.12 实机枚举）：
+//   [1]ファイル  : 0→save 1→load 2→qsave 3→qload 5→title 7→exit 8→vsave
+//   [2]画面      : 0→window 1→fullscreen
+//   [3]進行制御  : 0→log 1→auto 2→skip 3→backskip 5→next 6→prev 8→option
+//                  9→vreplay 10→nextscn 11→prevscn 12→backone 13→scnchart
+// 【坑】这个脚本里**不能用 `function` 声明，也不能用 `new Array(...)` 带参数** ——
+// 两者都会不可捕获地终止整段脚本（实测：`new Array("a","b")` 直接空返回，
+// `function cap(i,j){…}` 在 REPL 里时灵时不灵）。所以全部内联 + 数组字面量。
+static void FetchMenuLabels(void)
+{
+	g_menuLabelCount = 0;
+	const char *script =
+		"var m=global.kag.menu;var r=\"\";"
+		"var L=[\"save\",\"load\",\"qsave\",\"qload\",\"title\",\"exit\",\"vsave\","
+		"\"window\",\"fullscreen\",\"log\",\"auto\",\"skip\",\"backskip\",\"next\",\"prev\","
+		"\"option\",\"vreplay\",\"nextscn\",\"prevscn\",\"backone\",\"scnchart\","
+		"\"flowchart\",\"system\"];"
+		"var MI=[1,1,1,1,1,1,1,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3];"
+		"var II=[0,1,2,3,5,7,8,0,1,0,1,2,3,5,6,8,9,10,11,12,13,13,8];"
+		"for(var k=0;k<L.length;k++){var s=\"\";"
+		"try{var c=m.children[MI[k]];var d=c.children[II[k]];s=\"\"+d.caption;}catch(e){s=\"\";}"
+		"r+=L[k]+\"\\x01\"+s+\"\\x02\";}"
+		"return r;";
+	char *res = NULL;
+	ExecOnMainThread(script, &res);
+	if(!res) { diag("menu labels: 脚本没有返回（菜单可能还没建好）\n"); return; }
+	char *p = res;
+	while(*p && g_menuLabelCount < 64)
+	{
+		char *end = strchr(p, '\x02');
+		if(!end) break;
+		*end = 0;
+		char *tab = strchr(p, '\x01');
+		if(tab)
+		{
+			*tab = 0;
+			wchar_t raw[256], clean[128];
+			utf8ToW(tab + 1, raw, 256);
+			CleanMenuCaption(raw, clean, 128);
+			if(clean[0])
+			{
+				MenuLabel *m = &g_menuLabels[g_menuLabelCount++];
+				strncpy_s(m->layer, sizeof(m->layer), p, _TRUNCATE);
+				wcsncpy_s(m->text, 128, clean, _TRUNCATE);
+			}
+		}
+		p = end + 1;
+	}
+	free(res);
+	diagf("menu labels: %d 条\n", g_menuLabelCount);
+}
+
+// 玩家可能在游戏里**中途**改界面语言（标题右上角 / 菜单），插件必须跟着换。
+// 检测搭在已有的 5Hz 轮询上（语言标签随 poll 一起回来，不多发 TJS 调用），
+// 这里只做节流：最快 800ms 认一次。定义在导航段（要用到 g_nav 等）。
+#define LANG_CHECK_MS 800
+static DWORD g_langCheckAt = 0;
+static void ApplyLanguageTag(const char *tag);
+static void BuildGeneratedAliases(void);   // 定义在后面（别名表那一段）
+static void LoadUserLabels(void);          // 同上
+
+// 菜单栏要等 KAG 起来才有，所以懒加载：每次扫描时试一次，拿到就停。
+// 拿到之后要重建生成式别名（<动作>_key1/2 与 cp_<动作> 的文案来自这里）。
+static bool g_menuLoaded = false;
+static void EnsureMenuLabels(void)
+{
+	if(g_menuLoaded) return;
+	// 【实测】V2Link 阶段 `CurrentLanguageUITag` 可能还是空的（界面语言这时还没定下来），
+	// 于是回退成主要语言、加载错表。所以这里每扫描一次就重新问一遍，
+	// 直到真的拿到菜单 caption（那时说明界面已经建好了），之后不再问。
+	const char *before = g_langTag;
+	DetectLanguage();
+	if(_stricmp(before, g_langTag) != 0) LoadUserLabels();
+	FetchMenuLabels();
+	if(g_menuLabelCount > 0)
+	{
+		g_menuLoaded = true;
+		BuildGeneratedAliases();
+	}
 }
 
 static void SpeakLine(const wchar_t *name, const wchar_t *text)
@@ -766,36 +912,57 @@ static void PollDialogue(void)
 		"try{var __pl=global.kag.getPrimaryLayerAt(960,540);"
 		"if(__pl!=void){var __pn=\"\"+__pl.name;if(__pn==\"SysCoverLayer\")__cv=\"1\";}}catch(z0){}"
 		"if(__r==\"\"){__r=\"~|~~|~~|~~|~~|~~|~0\";}"
-		"return __r + \"~|~\" + __cv;";
+		// 末节：当前界面语言标签。玩家可能在游戏里中途改，所以每次轮询都捎回来，
+		// 由 C++ 侧节流判变化 —— 不额外发 TJS 调用。
+		"var __lg=\"\";"
+		"try{__lg=\"\"+global.CurrentLanguageUITag;}catch(z2){}"
+		"if(__lg==\"\"||__lg==\"undefined\"||__lg==\"null\"){"
+		"try{__lg=\"\"+global.CurrentLanguageTag;}catch(z3){}}"
+		"return __r + \"~|~\" + __cv + \"~|~\" + __lg;";
 	char *out = NULL;
 	ExecOnMainThread(kPoll, &out);
 	InterlockedExchange(&g_pollBusy, 0);
 	if(!out) return;
 
-	// 最后一节是「声明层是否盖住画面」；从**末尾**往回找，前面的字段就都还不受影响。
+	// 末尾两节：声明层是否盖住画面 / 当前界面语言标签。从后往前取，前面的字段不受影响。
+	int cover = 0;
+	char langBuf[16]; langBuf[0] = 0;
 	{
-		char *last = NULL;
-		for(char *q = out; (q = strstr(q, "~|~")) != NULL; q += 3) last = q;
-		if(last)
+		char *last = NULL, *prev = NULL;
+		for(char *q = out; (q = strstr(q, "~|~")) != NULL; q += 3) { prev = last; last = q; }
+		if(last) { strncpy_s(langBuf, sizeof(langBuf), last + 3, _TRUNCATE); *last = 0; }
+		if(prev) { cover = atoi(prev + 3); *prev = 0; }
+	}
+
+	// 界面语言中途被改了就跟着换（最快 800ms 认一次）
+	{
+		DWORD now = GetTickCount();
+		if((long)(now - g_langCheckAt) >= 0)
 		{
-			int cover = atoi(last + 3);
-			*last = 0;
-			if(cover)
+			g_langCheckAt = now + LANG_CHECK_MS;
+			if(langBuf[0] && _stricmp(langBuf, g_langTag) != 0)
 			{
-				if(!g_coverAnnounced)
-				{
-					g_coverAnnounced = true;
-					diag("cover announced\n");
-					SpeechSpeak(Ph(P_NOTICE), true);
-				}
 				free(out);
+				ApplyLanguageTag(langBuf);
 				return;
 			}
-			g_coverAnnounced = false;
 		}
 	}
 
-	// 次末一节是「这一句有没有配音」；同样从末尾往回取。
+	if(cover)
+	{
+		if(!g_coverAnnounced)
+		{
+			g_coverAnnounced = true;
+			diag("cover announced\n");
+			SpeechSpeak(Ph(P_NOTICE), true);
+		}
+		free(out);
+		return;
+	}
+	g_coverAnnounced = false;
+
+	// 倒数第三节是「这一句有没有配音」；同样从末尾往回取。
 	int voiced = 0;
 	{
 		char *last = NULL;
@@ -1102,7 +1269,9 @@ static const NameAlias g_alias[] = {
 	{ "option",    L"设置" },
 	{ "log",       L"历史记录（回想）" },      // 实点验证：打开 BACKLOG 面板
 	{ "auto",      L"自动播放" },
-	{ "skip",      L"快进" },
+	// 实测（日文界面截图）：这一格游戏自己写的是「スキップモード」，
+	// 中文界面「键盘」页同一行写「快速模式」；「快进」是 backskip 那一格。
+	{ "skip",      L"快速模式" },
 	{ "hide",      L"隐藏对话框" },
 	{ "scnchart",  L"流程图" },
 	{ "volchg",    L"音量调整" },
@@ -1110,7 +1279,7 @@ static const NameAlias g_alias[] = {
 	//      中文文案直接取自那一页的实测截图（见下面键盘页注释）。
 	{ "prev",      L"跳到上一个选项" },
 	{ "prevscn",   L"跳到上一个场景" },
-	{ "backskip",  L"快进（后退）" },
+	{ "backskip",  L"快进" },
 	{ "backone",   L"跳到上一句文本" },
 	{ "nextscn",   L"跳到下一个场景" },
 	{ "next",      L"跳到下一个选项" },
@@ -1351,7 +1520,7 @@ static const ActionLabel g_actions[] = {
 	{ "screen",   L"窗口／全屏切换" },
 	{ "click",    L"下一句／确定" },
 	{ "auto",     L"自动模式" },
-	{ "skip",     L"快进" },
+	{ "skip",     L"快速模式" },
 	{ "ctrl",     L"Ctrl 快进" },
 	{ "nextscn",  L"跳到下一个场景" },
 	{ "next",     L"跳到下一个选项" },
@@ -1404,14 +1573,17 @@ static void BuildGeneratedAliases(void)
 	{
 		wchar_t lab[128];
 		char nm[64];
+		// 动作名优先用游戏原生菜单栏的 caption（跟着界面语言走），拿不到才退回内建中文
+		const wchar_t *cap = MenuLabelFor(g_actions[i].action);
+		if(!cap) cap = g_actions[i].caption;
 		sprintf_s(nm, sizeof(nm), "%s_key1", g_actions[i].action);
-		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls 主键", g_actions[i].caption);
+		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls %ls", cap, Ph(P_KEY1));
 		AddGen(nm, lab);
 		sprintf_s(nm, sizeof(nm), "%s_key2", g_actions[i].action);
-		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls 副键", g_actions[i].caption);
+		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls %ls", cap, Ph(P_KEY2));
 		AddGen(nm, lab);
 		sprintf_s(nm, sizeof(nm), "cp_%s", g_actions[i].action);
-		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls（手势功能）", g_actions[i].caption);
+		_snwprintf_s(lab, 128, _TRUNCATE, L"%ls%ls", cap, Ph(P_GESTURE));
 		AddGen(nm, lab);
 	}
 	// 自定义按钮排列：排列条 / 槽位 / 按钮库都只有位置，没有可靠的功能名
@@ -1428,46 +1600,58 @@ static void BuildGeneratedAliases(void)
 // 格式： 每行 `层名=中文标签`，# 或 ; 开头是注释。ini 里的条目优先于内置表，
 // 于是「念出英文层名」这件事不需要改代码就能修。
 struct UserLabel { char name[64]; wchar_t label[128]; };
-static UserLabel g_userLabels[256];
+static UserLabel g_userLabels[512];
 static int g_userLabelCount = 0;
 
+static void LoadOneLabelFile(const wchar_t *rel)
+{
+	wchar_t p[MAX_PATH];
+	_snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%s%s", g_exeDir, rel);
+	FILE *f = NULL; _wfopen_s(&f, p, L"rb");
+	if(!f) return;
+	char buf[512];
+	int n = 0;
+	while(fgets(buf, sizeof(buf), f) && g_userLabelCount < 512)
+	{
+		char *s = buf;
+		if((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) s += 3;
+		while(*s == ' ' || *s == '\t') s++;
+		if(*s == '#' || *s == ';' || *s == '\r' || *s == '\n' || *s == 0) continue;
+		char *eq = strchr(s, '=');
+		if(!eq) continue;
+		*eq = 0;
+		char *nm = s; char *vl = eq + 1;
+		size_t nl = strlen(nm);
+		while(nl > 0 && (nm[nl-1] == ' ' || nm[nl-1] == '\t')) nm[--nl] = 0;
+		while(*vl == ' ' || *vl == '\t') vl++;
+		size_t vlLen = strlen(vl);
+		while(vlLen > 0 && (vl[vlLen-1] == '\r' || vl[vlLen-1] == '\n' || vl[vlLen-1] == ' ')) vl[--vlLen] = 0;
+		if(nl == 0 || vlLen == 0) continue;
+		UserLabel *u = &g_userLabels[g_userLabelCount];
+		strncpy_s(u->name, sizeof(u->name), nm, _TRUNCATE);
+		utf8ToW(vl, u->label, 128);
+		if(u->label[0]) { g_userLabelCount++; n++; }
+	}
+	fclose(f);
+	diagf("  labels[%d] ", n); diagW(p); diag("\n");
+}
+
+// 标签文件分两层，后面的覆盖前面的：
+//   1) a11y_labels.ini            —— 通用「改口供」，和语言无关
+//   2) a11y_labels_<语言标签>.ini —— 按游戏当前语言（jp / en / cn / tw）覆盖
+// 第二层是「控件也跟着语言走」的落点：内建表只有 cn 一列（逐条实机核对过），
+// 其它语言各放一个数据文件，可以增量补、可以随时改，都不用重新编译。
 static void LoadUserLabels(void)
 {
 	g_userLabelCount = 0;
-	const wchar_t *rel[] = { L"plugin\\a11y_labels.ini", L"a11y_labels.ini" };
-	for(int i = 0; i < 2; i++)
-	{
-		wchar_t p[MAX_PATH];
-		_snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%s%s", g_exeDir, rel[i]);
-		FILE *f = NULL; _wfopen_s(&f, p, L"rb");
-		if(!f) continue;
-		char buf[512];
-		while(fgets(buf, sizeof(buf), f) && g_userLabelCount < 256)
-		{
-			char *s = buf;
-			if((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) s += 3;
-			while(*s == ' ' || *s == '\t') s++;
-			if(*s == '#' || *s == ';' || *s == '\r' || *s == '\n' || *s == 0) continue;
-			char *eq = strchr(s, '=');
-			if(!eq) continue;
-			*eq = 0;
-			char *nm = s; char *vl = eq + 1;
-			size_t nl = strlen(nm);
-			while(nl > 0 && (nm[nl-1] == ' ' || nm[nl-1] == '\t')) nm[--nl] = 0;
-			while(*vl == ' ' || *vl == '\t') vl++;
-			size_t vlLen = strlen(vl);
-			while(vlLen > 0 && (vl[vlLen-1] == '\r' || vl[vlLen-1] == '\n' || vl[vlLen-1] == ' ')) vl[--vlLen] = 0;
-			if(nl == 0 || vlLen == 0) continue;
-			UserLabel *u = &g_userLabels[g_userLabelCount];
-			strncpy_s(u->name, sizeof(u->name), nm, _TRUNCATE);
-			utf8ToW(vl, u->label, 128);
-			if(u->label[0]) g_userLabelCount++;
-		}
-		fclose(f);
-		diagf("a11y_labels.ini: %d 条  ", g_userLabelCount);
-		diagW(p);
-		break;
-	}
+	LoadOneLabelFile(L"plugin\\a11y_labels.ini");
+	LoadOneLabelFile(L"a11y_labels.ini");
+	wchar_t rel[64];
+	_snwprintf_s(rel, 64, _TRUNCATE, L"plugin\\a11y_labels_%hs.ini", g_langTag);
+	LoadOneLabelFile(rel);
+	_snwprintf_s(rel, 64, _TRUNCATE, L"a11y_labels_%hs.ini", g_langTag);
+	LoadOneLabelFile(rel);
+	diagf("a11y_labels: 共 %d 条（lang=%s）\n", g_userLabelCount, g_langTag);
 }
 
 // 没有把握的层名不做翻译，直接念层名本身 —— 宁可听起来生硬，也不编。
@@ -1480,6 +1664,11 @@ static void LabelOf(const char *name, wchar_t *out, int cap)
 			wcsncpy_s(out, cap, g_userLabels[u].label, _TRUNCATE);
 			return;
 		}
+	}
+	// 游戏原生菜单栏的 caption 优先于内建表：那是游戏自己的用词，而且自带四语
+	{
+		const wchar_t *ml = MenuLabelFor(name);
+		if(ml) { wcsncpy_s(out, cap, ml, _TRUNCATE); return; }
 	}
 	for(int i = 0; i < g_aliasCount; i++)
 	{
@@ -1743,12 +1932,34 @@ static void EnrichSaveSlots(void)
 	}
 }
 
+// 界面语言变了：重新选标签文件、重抓菜单 caption、重建生成式别名。
+// 正在导航的话顺手重扫一遍，并强制播报「界面已更新」让用户立刻听到新语言。
+static void ApplyLanguageTag(const char *tag)
+{
+	if(_stricmp(tag, "jp") == 0)      { g_lang = LANG_JP; g_langTag = "jp"; }
+	else if(_stricmp(tag, "en") == 0) { g_lang = LANG_EN; g_langTag = "en"; }
+	else if(_stricmp(tag, "tw") == 0) { g_lang = LANG_TW; g_langTag = "tw"; }
+	else                              { g_lang = LANG_CN; g_langTag = "cn"; }
+	diagf("language changed -> %s，重新加载标签\n", g_langTag);
+	FetchMenuLabels();
+	LoadUserLabels();
+	BuildGeneratedAliases();
+	if(g_nav)
+	{
+		g_namesBuf[0] = 0;            // 清掉缓存的名字串，逼「界面已更新」那条播报出来
+		g_scanOnEnter = false;
+		g_scanPending = true;
+		g_scanAt = GetTickCount() + 150;
+	}
+}
+
 static void ScanItems(void)
 {
 	g_itemCount = 0;
 	g_isBacklog = false;
 	g_isCover = false;
 	g_histCount = 0;
+	EnsureMenuLabels();   // 菜单栏 caption（动作名的四语来源），拿到一次就够
 	char *out = NULL;
 	ExecOnMainThread(kScanScript, &out);
 	if(!out) { diag("scan: 探针脚本没有返回\n"); return; }
@@ -2382,6 +2593,10 @@ extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 	diagf("dispatch=%p execScript=%p allocStr=%p doTry=%p\n", funcs[0], funcs[2], funcs[3], funcs[4]);
 	if(!g_executeScript || !g_allocVariantString || !g_doTryBlock) { diag("engine entry points missing\n"); return E_FAIL; }
 	DetectLanguage();   // 函数指针就绪后才能问游戏的语言标签
+	LoadUserLabels();   // 语言标签已知，重新加载一次 a11y_labels_<tag>.ini
+	BuildGeneratedAliases();
+	// 菜单栏的 caption 这时**还取不到**（KAG 的窗口菜单还没建），
+	// 由 EnsureMenuLabels() 在第一次扫描时懒加载。
 
 	if(SpeechInit())
 	{
