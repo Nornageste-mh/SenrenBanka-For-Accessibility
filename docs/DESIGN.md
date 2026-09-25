@@ -218,3 +218,37 @@ property <name> {
 开发用通道执行脚本时会复用同一个 TJS 全局对象，上一次留下的变量会漏进下一次。
 写探测脚本必须自己 `var`，否则会读到上一次的残留值（曾因此拿到一批假坐标）。
 
+## 11. 用游戏的数据，不用自己的话（0.0.0.3 补充）
+
+这一轮全是「调整」，没有修 BUG，但把三条原则落成了代码，值得记下来：
+
+**先找游戏自己的 API，找不到再自己造。**
+存档界面看起来只能看见 16 个格子，其实游戏把整件事交给了 KAG 的 bookmark API：
+`getBookMarkFileNameAtNum` / `getBookMarkInfo` / `getBookMarkPageName` / `getBookMarkDate` /
+`getBookMarkPlayTime` / `getBookMarkProtectedState`（全在 `global.kag` 上，
+线索来自 `saveload.tjs` 里那批 `calld %2, %-2.getBookMark...(…)` 的转发）。
+拿到它之后，「有没有存档」变成一个纯数值判断（`getBookMarkPlayTime(n) > 0`），
+「存了什么」直接念游戏返回的章节名与日期 —— **不需要读懂任何存档文件格式**。
+
+同理，「快存槽有几个、每页几个」也是数出来的：从 0 往上数文件名前缀，
+而不是把 12 写进代码。写死的常量会在别处被改（这一作的存档网格就是 4×4 但只有 3 行可见）。
+
+**内部状态字段要在同一条记录上并排打出来看。**
+`currentInfo.voice` 起初完全不知道存在；它是从 `backlog.tjs` 的 `setNewAction` 里
+`spde %2.voice, %-3` 这句反推出来的，再回实机上把 `typeof` 打出来确认
+（有配音 = Object，没有 = undefined）。**先看代码里怎么写，再去实机确认它真的在**，
+比反过来省事得多。
+
+**「跟着语言走」= 探测标签 + 表里放多列 + 能用游戏的就用游戏的。**
+`global.CurrentLanguageTag` 给出 jp/en/cn/tw，和官方 `syslangtext_<tag>.ini` 一一对应。
+插件自己的话术按四列存；**游戏本来就有的文案一个字都不自己写**。
+cn 那一列是逐条实机核对过的，jp/en/tw 是意译 —— 这一点在源码和变更记录里都写明了，
+不假装它们是官方用词。
+
+**靠位置索引的表，加条目时两处必须同顺序。**
+`g_phrases[]` 用 enum 当下标，没有键。把 `P_PAGE` 加进 enum 中间、表行却加在
+`P_SLOT` 后面，结果是其后每条话术整体移一位 —— 界面上直接念出「第 %d 页」。
+这类错误编译器不会报，只能靠实机日志里「出现了没被替换的格式符」发现。
+现在表头写了警告；排查这类问题最快的办法就是 grep 日志里的 `%d` / `%ls`。
+
+

@@ -1,5 +1,55 @@
 # 变更记录
 
+## 0.0.0.3
+
+三处调整（都不是修 BUG），外加顺带发现并修掉的几处。
+
+**一、存档位读出「有没有存档」**
+
+- 全部走游戏自己的 bookmark API，一个数字都不猜：
+  `kag.getBookMarkFileNameAtNum` / `getBookMarkPlayTime` / `getBookMarkPageName` / `getBookMarkDate`。
+- **快存槽数与每页槽数是数出来的，不是写死的**：从 0 往上数文件名以 `data_quick_` 开头的
+  有几个（实测 12），接着数 `data_0001_` 开头的有几个（实测 12）。当前页取
+  `global.Current.page`。文件名实测：`data_quick_01..12` → `data_0001_01..12` → `data_0002_01…`。
+- 空 / 有存档用 `getBookMarkPlayTime(n) > 0` 判断 —— **纯数值判据，不含任何文案**。
+  有存档时直接念游戏给的章节名与日期。实测：
+  `存档位 1：chapter　3-2，2026/09/25 19:47` / `存档位 2：空`，与实机截图逐格一致
+  （截图里只有 `0001-01` 有缩略图，其余全是 `NO DATA`）。
+- 踩坑记录：**不要用 `getBookMarkDateText(n)`** —— 它对任何槽位都只返回
+  `1970/01/01 08:00` 这个无效默认值，真日期在 `getBookMarkDate(n)` 里。
+
+**二、有配音的台词不再自动朗读，但退格仍可重读**
+
+- 判据来自游戏数据：`kag.historyLayer.currentInfo.voice` 是 Object 就表示这一句有配音
+  （`backlog.tjs` 的 `setNewAction` 里 `spde currentInfo.voice` 写入），undefined 表示没有。
+- 有配音 → 不再叠一层 TTS（人声已经在读了），但 `g_lastText` / `g_lastAnnounced`
+  照常更新，所以**「退格重读这一句」完全不受影响** —— 配音只影响自动朗读，不影响按需朗读。
+- 实测：`voiced -> tts suppressed: 「当然了，我也想跟她们搞好关系……」`，
+  随后按退格念出 `廉太郎，「当然了，我也想跟她们搞好关系……」`。
+
+**三、文案跟着游戏的语言走**
+
+- 启动时读一次 `global.CurrentLanguageTag`（实测 `cn`），插件自己说的话不再写死中文。
+- 24 条自有话术按 **jp / en / cn / tw 四列**存放，按当前语言标签取。cn 列逐条实机核对过；
+  jp / en / tw 是意译，**不保证与官方用词一致**，想改不用重编译
+  （`plugin\a11y_labels.ini` 可覆盖标签，话术表在源码 `g_phrases` 里）。
+- 凡是**游戏自己就有**的文案一律用游戏返回的原字，不自己造：存档的章节名与日期即是一例。
+
+**顺带发现并修掉的**
+
+- **存档网格第 4 行是画面上看不见的假控件。** `ParentHackLayer` 高 720，而
+  `item30..item33` 的 `y=738` 整行落在容器外，`visible` 却仍是 1 ——
+  收进导航就是一个点不到的假项。扫描现在按父容器矩形裁剪子控件。
+- **翻页按钮方向反了。** 实测位置是 `page_top(523) page_dw10(565) page_dw1(607)`
+  `[slider] page_up1(905) page_up10(947) page_end(989)`，画面上左侧是「往前」、
+  右侧是「往后」，所以 `page_up*` 是**往后**翻。旧标签把 `page_up1` 写成「上一页」，
+  方向是反的。已按实测位置改正，并补上 `page_top` / `page_dw1` / `page_dw10` /
+  `page_add`（增加一页）/ `page_del`（减少一页）/ `page_num` / `page_text`。
+- `ParentHackLayer`（存档槽定位容器）与 `detail`（读档界面左侧详情面板）不再是导航项。
+- **文案表与 enum 错位**：把 `P_PAGE` 加进 enum 中间、表行却加在 `P_SLOT` 后面，
+  导致其后每条话术整体移一位，界面上直接念出了「第 %d 页」。已修正，
+  并在源码表头写了「两处必须同顺序」的警告。
+
 ## 0.0.0.2
 
 界面覆盖：回忆（历史记录）、设置界面全部 8 个页签、启动「注意」声明、工具栏补全。

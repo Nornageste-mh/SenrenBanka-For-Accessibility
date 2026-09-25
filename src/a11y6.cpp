@@ -596,6 +596,104 @@ static void BuildChoiceLabels(const wchar_t *summary)
 	}
 }
 
+// ===================== 界面文案：跟着游戏的语言走 =====================
+//
+// 两条纪律：
+//   1) 插件自己要说的话（「导航模式」「已激活…」）**不写死中文** —— 按游戏当前语言标签
+//      选。标签取自 `global.CurrentLanguageTag`（实测 'cn'；可选项 jp/en/cn/tw，
+//      来自 SystemConfig.multiLangLanguageTags，与官方 syslangtext_<tag>.ini 一一对应）。
+//   2) 凡是**游戏自己就有**的文案，一律用游戏返回的原字，不自己造 ——
+//      例如存档槽的标题与日期来自 kag.getBookMarkPageName / getBookMarkDateText，
+//      空槽判定用 kag.getBookMarkPlayTime(n)==0（数值，不含文案）。
+//
+// 内建表里 cn 这一列是逐条实机核对过的；jp/en/tw 是我们自己写的意译，
+// 不保证与官方用词一致。想改不用重编译，往 plugin\a11y_labels.ini 里覆盖即可。
+enum { LANG_JP = 0, LANG_EN, LANG_CN, LANG_TW };
+static int g_lang = LANG_CN;
+
+enum {
+	P_NAV_ENTER, P_NAV_EXIT, P_NAV_ON, P_UPDATED, P_ACTIVATED, P_NOITEM,
+	P_SLOT, P_EMPTY, P_LINE, P_CHOICES, P_PRESS_DIGIT, P_SELECTED, P_PAGE,
+	P_SKIP_START, P_SKIP_END, P_SKIP_STUCK, P_SKIP_NOTADV, P_SKIP_NONAV, P_SKIP_NOTEXT,
+	P_SLIDER_NO, P_SLIDER_PCT, P_NO_WINDOW, P_NOTICE, P_NOTHING_READ, P_LOADED,
+	P_COUNT
+};
+
+struct UiPhrase { const wchar_t *jp, *en, *cn, *tw; };
+// 这张表**必须与上面的 enum 一一对应**（靠位置取值，没有键）。
+// 曾经把 P_PAGE 加进 enum 中间、表行却加在 P_SLOT 后面 → 后面每条文案整体移一位，
+// 界面上直接念出了「第 %d 页」。加新条目时两处一起改，且保持同一个顺序。
+static const UiPhrase g_phrases[P_COUNT] = {
+	/* P_NAV_ENTER     */ { L"ナビゲーションモード。", L"Navigation mode.", L"导航模式。", L"導航模式。" },
+	/* P_NAV_EXIT      */ { L"ナビゲーションモードを終了しました。", L"Navigation mode off.", L"已退出导航模式。", L"已結束導航模式。" },
+	/* P_NAV_ON        */ { L"ナビゲーションモード、%d 項目、", L"Navigation mode, %d items, ", L"导航模式，共 %d 项，", L"導航模式，共 %d 項，" },
+	/* P_UPDATED       */ { L"画面が更新されました、", L"Screen updated, ", L"界面已更新，", L"介面已更新，" },
+	/* P_ACTIVATED     */ { L"%ls を実行しました", L"Activated %ls", L"已激活 %ls", L"已啟用 %ls" },
+	/* P_NOITEM        */ { L"この画面に操作できる項目はありません。", L"No operable items on this screen.", L"当前界面上没有可操作的项目。", L"目前介面上沒有可操作的項目。" },
+	/* P_SLOT          */ { L"セーブ %d", L"Save slot %d", L"存档位 %d", L"存檔位 %d" },
+	/* P_EMPTY         */ { L"空き", L"empty", L"空", L"空" },
+	/* P_LINE          */ { L"%d 行目", L"Line %d", L"第 %d 句", L"第 %d 句" },
+	/* P_CHOICES       */ { L"選択肢 %d 個。", L"%d choices. ", L"选项 %d 个。", L"選項 %d 個。" },
+	/* P_PRESS_DIGIT   */ { L"数字キーで選択。", L"Press a number key to choose.", L"按数字键选择。", L"按數字鍵選擇。" },
+	/* P_SELECTED      */ { L"%ls を選択しました", L"Selected %ls", L"已选择 %ls", L"已選擇 %ls" },
+	/* P_PAGE          */ { L"%d ページ", L"Page %d", L"第 %d 页", L"第 %d 頁" },
+	/* P_SKIP_START    */ { L"早送り開始。選択肢で止まります。", L"Fast-forward started; it stops at choices.", L"快进开始，遇到选项会停下来。", L"快進開始，遇到選項會停下來。" },
+	/* P_SKIP_END      */ { L"早送り終了。", L"Fast-forward finished.", L"快进结束。", L"快進結束。" },
+	/* P_SKIP_STUCK    */ { L"進まなくなりました。早送りを停止します。", L"Stopped advancing; fast-forward halted.", L"推进不动了，快进停止。", L"推不動了，快進停止。" },
+	/* P_SKIP_NOTADV   */ { L"いま物語の中ではないようです。早送りは開始しません。", L"Not in the story now; fast-forward not started.", L"现在好像不在剧情里，快进没有启动。", L"現在好像不在劇情裡，快進沒有啟動。" },
+	/* P_SKIP_NONAV   */ { L"ナビゲーションモード中は早送りできません。", L"Fast-forward is disabled in navigation mode.", L"导航模式下不启动快进。", L"導航模式下不啟動快進。" },
+	/* P_SKIP_NOTEXT   */ { L"いまテキストがありません。早送りは開始しません。", L"No text now; fast-forward not started.", L"现在没有剧情文本，快进没有启动。", L"現在沒有劇情文字，快進沒有啟動。" },
+	/* P_SLIDER_NO     */ { L"この項目は左右キーでは調整できません。", L"This item cannot be adjusted with left/right.", L"这一项不能用左右方向键调整。", L"這一項不能用左右方向鍵調整。" },
+	/* P_SLIDER_PCT    */ { L"%d パーセントに設定しました", L"Set to %d percent", L"已调到百分之 %d", L"已調到百分之 %d" },
+	/* P_NO_WINDOW     */ { L"ゲームウィンドウが見つかりません。後でもう一度お試しください。", L"Game window not found; please try again later.", L"还没有找到游戏窗口，请稍后再试。", L"還沒有找到遊戲視窗，請稍後再試。" },
+	/* P_NOTICE        */ {
+		L"注意。本作品はフィクションです。登場人物・団体名・地名・設定などはすべて架空で、"
+		L"現実とは関係ありません。本作品は YUZOSOFT の著作物であり、無断での複製・改変・録音・"
+		L"レンタル・配布・放送などを禁じます。登場するキャラクターはすべて 18 歳以上です。"
+		L"スペースか Enter で続けます。",
+		L"Notice. This work is fiction. All characters, organizations, place names and settings are "
+		L"fictional and unrelated to reality. This work is the property of YUZOSOFT; unauthorized "
+		L"copying, modification, recording, rental, distribution or broadcast is prohibited. "
+		L"All characters are over 18. Press Space or Enter to continue.",
+		L"注意。本作品纯属虚构，登场人物、团体名、地名、设定等全部为虚构，与现实毫无关联。"
+		L"本作品是柚子公司（YUZOSOFT）的著作，未经许可禁止将本作品中的内容进行复制、修改、"
+		L"录音、租赁、发布、播出。本作品中出现的所有角色年龄均已超过 18 周岁。"
+		L"按空格或回车继续。",
+		L"注意。本作品純屬虛構，登場人物、團體名、地名、設定等全部為虛構，與現實毫無關聯。"
+		L"本作品是柚子公司（YUZOSOFT）的著作，未經許可禁止將本作品中的內容進行複製、修改、"
+		L"錄音、租賃、發布、播出。本作品中出現的所有角色年齡均已超過 18 週歲。"
+		L"按空格或 Enter 繼續。" },
+	/* P_NOTHING_READ  */ { L"まだ何も読み上げていません。", L"Nothing has been read yet.", L"还没有朗读过内容。", L"還沒有朗讀過內容。" },
+	/* P_LOADED        */ { L"アクセシビリティモジュールを読み込みました。音声バックエンド %s", L"Accessibility module loaded. Speech backend: %s", L"无障碍模块已加载，语音后端 %s", L"無障礙模組已載入，語音後端 %s" },
+};
+
+static const wchar_t *Ph(int id)
+{
+	if(id < 0 || id >= P_COUNT) return L"";
+	const UiPhrase *p = &g_phrases[id];
+	switch(g_lang)
+	{
+	case LANG_JP: return p->jp;
+	case LANG_EN: return p->en;
+	case LANG_TW: return p->tw;
+	default:      return p->cn;
+	}
+}
+
+// 读一次游戏当前语言标签。必须在函数指针解析之后调用（见 V2Link 里 DetectLanguage()）。
+static void DetectLanguage(void)
+{
+	char *out = NULL;
+	ExecOnMainThread("var r=\"cn\";try{r=\"\"+global.CurrentLanguageTag;}catch(e){}return r;", &out);
+	if(!out) return;
+	if(strncmp(out, "jp", 2) == 0)      g_lang = LANG_JP;
+	else if(strncmp(out, "en", 2) == 0) g_lang = LANG_EN;
+	else if(strncmp(out, "tw", 2) == 0) g_lang = LANG_TW;
+	else                                g_lang = LANG_CN;
+	diagf("language tag=%s\n", out);
+	free(out);
+}
+
 static void SpeakLine(const wchar_t *name, const wchar_t *text)
 {
 	if(name && name[0]) _snwprintf_s(g_lastAnnounced, 4600, _TRUNCATE, L"%s，%s", name, text);
@@ -654,7 +752,11 @@ static void PollDialogue(void)
 		"      } catch(y2) {}"
 		"      var __s = \"-1\";"
 		"      try { __s = \"\" + global.kag.selectShowing; } catch(y3) { __s = \"-1\"; }"
-		"      __r = __n + \"~|~\" + __t + \"~|~\" + __p + \"~|~\" + __m + \"~|~\" + __c + \"~|~\" + __s;"
+		// 这一句有没有配音：currentInfo.voice 是 Object 表示有（backlog.tjs 的
+		// setNewAction 里 `spde currentInfo.voice` 写入），undefined 表示没有。
+		"      var __v = \"0\";"
+		"      try { if(typeof __i.voice == \"Object\") __v = \"1\"; } catch(v1) { __v = \"0\"; }"
+		"      __r = __n + \"~|~\" + __t + \"~|~\" + __p + \"~|~\" + __m + \"~|~\" + __c + \"~|~\" + __s + \"~|~\" + __v;"
 		"    }"
 		"  }"
 		"} catch(e) { __r = \"\"; }"
@@ -663,7 +765,7 @@ static void PollDialogue(void)
 		"var __cv=\"0\";"
 		"try{var __pl=global.kag.getPrimaryLayerAt(960,540);"
 		"if(__pl!=void){var __pn=\"\"+__pl.name;if(__pn==\"SysCoverLayer\")__cv=\"1\";}}catch(z0){}"
-		"if(__r==\"\"){__r=\"~|~~|~~|~~|~~|~\";}"
+		"if(__r==\"\"){__r=\"~|~~|~~|~~|~~|~~|~0\";}"
 		"return __r + \"~|~\" + __cv;";
 	char *out = NULL;
 	ExecOnMainThread(kPoll, &out);
@@ -684,16 +786,21 @@ static void PollDialogue(void)
 				{
 					g_coverAnnounced = true;
 					diag("cover announced\n");
-					SpeechSpeak(L"注意。本作品纯属虚构，登场人物、团体名、地名、设定等"
-					            L"全部为虚构，与现实毫无关联。本作品是柚子公司（YUZOSOFT）的著作，"
-					            L"未经许可禁止将本作品中的内容进行复制、修改、录音、租赁、发布、播出。"
-					            L"本作品中出现的所有角色年龄均已超过 18 周岁。按空格或回车继续。", true);
+					SpeechSpeak(Ph(P_NOTICE), true);
 				}
 				free(out);
 				return;
 			}
 			g_coverAnnounced = false;
 		}
+	}
+
+	// 次末一节是「这一句有没有配音」；同样从末尾往回取。
+	int voiced = 0;
+	{
+		char *last = NULL;
+		for(char *q = out; (q = strstr(q, "~|~")) != NULL; q += 3) last = q;
+		if(last) { voiced = atoi(last + 3); *last = 0; }
 	}
 
 	char *sep = strstr(out, "~|~");
@@ -756,18 +863,30 @@ static void PollDialogue(void)
 		// 选项场景：逐条报出中文选项，并说明数字键选择（框架的「数字键选择选项」）
 		BuildChoiceLabels(line);
 		wchar_t say[1024];
-		int off = _snwprintf_s(say, 1024, _TRUNCATE, L"选项 %d 个。", g_choiceCount);
+		int off = _snwprintf_s(say, 1024, _TRUNCATE, Ph(P_CHOICES), g_choiceCount);
 		for(int i = 0; i < g_choiceCount && off > 0 && off < 800; i++)
 			off += _snwprintf_s(say + off, 1024 - off, _TRUNCATE, L"%d，%ls。", i + 1, g_choiceLabels[i]);
-		if(off > 0 && off < 950) _snwprintf_s(say + off, 1024 - off, _TRUNCATE, L"按数字键选择。");
+		if(off > 0 && off < 950) _snwprintf_s(say + off, 1024 - off, _TRUNCATE, L"%ls", Ph(P_PRESS_DIGIT));
 		wcsncpy_s(g_lastAnnounced, 4600, say, _TRUNCATE);
 		SpeechSpeak(say, true);
 	}
-	else
+	else if(g_skip)
 	{
 		// 快进时不朗读过路台词（免得语音队列把选项那一条淹了）；
 		// g_lastText 上面已经更新，快进的「推得动推不动」判据不受影响。
-		if(!g_skip) SpeakLine(name, line);
+	}
+	else if(voiced)
+	{
+		// 这一句**有配音**：人声已经在读了，不再叠一层 TTS。
+		// 但 g_lastAnnounced / g_lastText 照常更新，所以「退格重读这一句」仍然可用 ——
+		// 也就是说配音只影响「自动朗读」，不影响「按需朗读」。
+		if(name[0]) _snwprintf_s(g_lastAnnounced, 4600, _TRUNCATE, L"%ls，%ls", name, line);
+		else        _snwprintf_s(g_lastAnnounced, 4600, _TRUNCATE, L"%ls", line);
+		diag("voiced -> tts suppressed: "); diagW(line); diag("\n");
+	}
+	else
+	{
+		SpeakLine(name, line);
 	}
 }
 
@@ -868,6 +987,8 @@ static bool Excluded(const char *name)
 	if(_stricmp(name, "head") == 0) return true;       // 「自定义按钮排列」横幅
 	if(_stricmp(name, "szopaccaps") == 0) return true; // 「尺寸 / 透明度」说明条
 	if(_stricmp(name, "icons_area") == 0) return true;
+	if(_stricmp(name, "ParentHackLayer") == 0) return true;  // 存档槽的定位容器
+	if(_stricmp(name, "detail") == 0) return true;           // 读档界面左侧详情面板
 
 	// 设置界面所有滑条都是「<名>（滑条本体）+ _rail（轨道）+ _val（数值框）+
 	// _num_bg（数值底图）」四个图层。轨道高 6px、底图是装饰，数值框只有 59x21，
@@ -939,6 +1060,10 @@ static const char *kScanScript =
 	"try{ct=c.top;}catch(c7){}"
 	"if(cw<20||chh<20)continue;"
 	"if(cw>1600||chh>1000)continue;"
+	// 落在父容器之外的子控件是被裁掉的：实测存档网格 ParentHackLayer 高 720，
+	// 第 4 行 item30..item33 的 y=738 整行在容器外、画面上根本看不见，
+	// 但 visible 仍是 1 —— 收进来就是点不到的假控件。
+	"if(cl<-1||ct<-1||cl+cw>WW[j]+1||ct+chh>HH[j]+1)continue;"
 	"var dp=0;for(var d=0;d<SN.length;d++){if(SN[d]==cnm){dp=1;break;}}"
 	"if(dp==1)continue;"
 	"SN.push(cnm);KC[j]=1;"
@@ -1002,11 +1127,22 @@ static const NameAlias g_alias[] = {
 	{ "title2",    L"回到标题界面" },
 	{ "to_quick",  L"快速读档" },
 	{ "to_voice",  L"语音收藏夹" },
+	// 同样两个界面来回切：存档页上它写「读档」，读档页上写「存档」，取中性说法
+	{ "to_load",   L"存档／读档切换" },
 	{ "slider",    L"滚动条" },
-	{ "page_up1",  L"上一页" },
-	{ "page_up10", L"往前十页" },
-	{ "page_add",  L"下一页" },
+	// 页码控件实测位置：page_top(523) page_dw10(565) page_dw1(607) [slider] page_up1(905)
+	// page_up10(947) page_end(989) —— 画面上左侧是「往前」、右侧是「往后」，
+	// 所以 up 那一组是往后翻（旧版按名字直译成了「上一页」，方向是反的）。
+	{ "page_top",  L"第一页" },
+	{ "page_dw1",  L"往前一页" },
+	{ "page_dw10", L"往前十页" },
+	{ "page_up1",  L"往后一页" },
+	{ "page_up10", L"往后十页" },
 	{ "page_end",  L"最后一页" },
+	{ "page_add",  L"增加一页" },
+	{ "page_del",  L"减少一页" },
+	{ "page_num",  L"页码" },
+	{ "page_text", L"页码" },
 	// ---- 设置界面（实机截图 shots\settings_map.png + 40 项探针转储逐项对照）
 	//      每个选项是**左右两个独立子控件**，两半各有名字，所以两半各有标签。
 	//      层名描述底层标志位、画面显示人话，两者有时相反：noeff_off（左，高亮）
@@ -1454,8 +1590,10 @@ static int FetchHistory(int cap)
 					wchar_t line[512];
 					wcsncpy_s(line, 512, chosen, _TRUNCATE);
 					line[tl] = 0;
-					if(wnm[0]) _snwprintf_s(it->label, 512, _TRUNCATE, L"第 %d 句 %ls：%ls", start + i + 1, wnm, line);
-					else       _snwprintf_s(it->label, 512, _TRUNCATE, L"第 %d 句 %ls", start + i + 1, line);
+					wchar_t num[96];
+					_snwprintf_s(num, 96, _TRUNCATE, Ph(P_LINE), start + i + 1);
+					if(wnm[0]) _snwprintf_s(it->label, 512, _TRUNCATE, L"%ls %ls：%ls", num, wnm, line);
+					else       _snwprintf_s(it->label, 512, _TRUNCATE, L"%ls %ls", num, line);
 					it->hx = -1; it->hy = -1;
 					it->left = made; it->top = made; it->w = 0; it->h = 0;
 					it->isChild = false;
@@ -1478,6 +1616,131 @@ static bool IsSaveOrLoadScreen(void)
 		   _stricmp(n, "to_quick") == 0 || _stricmp(n, "thumbview") == 0) return true;
 	}
 	return false;
+}
+
+// ---------------- 存档槽：有没有存档 ----------------
+//
+// 全部走游戏自己的 API（`global.kag` 上的 bookmark 系列，实测可用），一个数字都不猜：
+//   · 快存槽个数 Q  ：从 0 往上数，文件名以 data_quick_ 开头的有几个
+//   · 每页槽数  PS ：接着数 data_0001_ 开头的有几个（实测 12，且正好等于网格里
+//                     落在容器内的 item 数）
+//   · 当前页    pg ：global.Current.page（存档界面上实测 =1）
+//   · 有没有存档   ：getBookMarkPlayTime(n) > 0 —— **数值**判据，不含任何文案
+//   · 存了什么     ：getBookMarkPageName(n)（章节名）与 getBookMarkDate(n)（日期），
+//                     都是游戏返回的本地化文本，直接念，不自己拼。
+//                     注意**不要**用 getBookMarkDateText(n)：实测它只返回
+//                     1970/01/01 08:00 这个无效默认值，真日期在 getBookMarkDate(n) 里。
+// 文件名实测：0..11 → data_quick_01..12，12..23 → data_0001_01..12，24.. → data_0002_01…
+// Q / PS 推出一次就缓存（一局之内不会变），免得每次扫描都拿主线程去数几十次。
+static int g_slotQ = -1, g_slotPS = -1;
+
+struct SlotInfo { int play; wchar_t page[128]; wchar_t date[96]; };
+static SlotInfo g_slots[64];
+static int g_slotCount = 0;
+static int g_slotPage = 1;
+
+static void FetchSlots(void)
+{
+	g_slotCount = 0;
+	char code[2048];
+	_snprintf_s(code, sizeof(code), _TRUNCATE,
+		"var k=global.kag;var r=\"\";"
+		"var nm=function(i){var s=\"\";try{s=\"\"+k.getBookMarkFileNameAtNum(i);}catch(e){s=\"\";}return s;};"
+		"var Q=%d;var PS=%d;"
+		"if(Q<0){Q=0;while(Q<64&&nm(Q).indexOf(\"data_quick_\")>=0)Q++;}"
+		"if(PS<0){PS=0;while(PS<64&&nm(Q+PS).indexOf(\"data_0001_\")>=0)PS++;}"
+		"var pg=1;try{pg=global.Current.page;}catch(e1){}"
+		"if(pg<1)pg=1;"
+		"r=\"\"+Q+\"\\x01\"+PS+\"\\x01\"+pg+\"\\x01\";"
+		"for(var j=0;j<PS&&j<64;j++){"
+		"var n=Q+(pg-1)*PS+j;"
+		"var pt=-1;try{pt=global.kag.getBookMarkPlayTime(n);}catch(e2){pt=-1;}"
+		"var pn=\"\";try{pn=\"\"+global.kag.getBookMarkPageName(n);}catch(e3){}"
+		"var dt=\"\";try{dt=\"\"+global.kag.getBookMarkDate(n);}catch(e4){}"
+		"r+=j+\"\\x01\"+pt+\"\\x01\"+pn+\"\\x01\"+dt+\"\\x02\";"
+		"}"
+		"return r;", g_slotQ, g_slotPS);
+
+	char *res = NULL;
+	ExecOnMainThread(code, &res);
+	if(!res) return;
+	char *p = res;
+	int seps = 0;
+	while(*p && seps < 3) { if(*p == '\x01') seps++; p++; }
+	if(seps == 3)
+	{
+		g_slotQ = atoi(res);
+		const char *s2 = strchr(res, '\x01');
+		g_slotPS = s2 ? atoi(s2 + 1) : -1;
+		const char *s3 = s2 ? strchr(s2 + 1, '\x01') : NULL;
+		g_slotPage = s3 ? atoi(s3 + 1) : 1;
+		while(*p && g_slotCount < 64)
+		{
+			char *end = strchr(p, '\x02');
+			if(!end) break;
+			*end = 0;
+			char *a1 = strchr(p, '\x01');
+			if(a1)
+			{
+				*a1 = 0;
+				char *a2 = strchr(a1 + 1, '\x01');
+				if(a2)
+				{
+					*a2 = 0;
+					char *a3 = strchr(a2 + 1, '\x01');
+					if(a3)
+					{
+						*a3 = 0;
+						int j = atoi(p);
+						if(j >= 0 && j < 64)
+						{
+							g_slots[j].play = atoi(a1 + 1);
+							utf8ToW(a2 + 1, g_slots[j].page, 128);
+							utf8ToW(a3 + 1, g_slots[j].date, 96);
+							if(j + 1 > g_slotCount) g_slotCount = j + 1;
+						}
+					}
+				}
+			}
+			p = end + 1;
+		}
+	}
+	free(res);
+	diagf("slots: Q=%d PS=%d page=%d got=%d\n", g_slotQ, g_slotPS, g_slotPage, g_slotCount);
+}
+
+// item<行><列>：行 0..2、列 0..3（第 4 行在容器外，已在扫描里剔掉），页内序号 = 行*4+列
+static int SlotIndexOf(const char *n)
+{
+	if(!n || strncmp(n, "item", 4) != 0) return -1;
+	if(!isdigit((unsigned char)n[4]) || !isdigit((unsigned char)n[5]) || n[6]) return -1;
+	return (n[4] - '0') * 4 + (n[5] - '0');
+}
+
+static void EnrichSaveSlots(void)
+{
+	FetchSlots();
+	if(g_slotCount <= 0) return;
+	for(int i = 0; i < g_itemCount; i++)
+	{
+		int k = SlotIndexOf(g_items[i].name);
+		if(k < 0 || k >= g_slotCount) continue;
+		wchar_t num[96], pgTxt[96];
+		_snwprintf_s(num, 96, _TRUNCATE, Ph(P_SLOT), k + 1);
+		// 多页时把页码带上，否则「存档位 3」在第几页并不清楚
+		if(g_slotPage > 1)
+		{
+			wchar_t pg[64];
+			_snwprintf_s(pg, 64, _TRUNCATE, Ph(P_PAGE), g_slotPage);
+			_snwprintf_s(pgTxt, 96, _TRUNCATE, L"%ls %ls", pg, num);
+		}
+		else wcsncpy_s(pgTxt, 96, num, _TRUNCATE);
+		if(g_slots[k].play > 0)
+			_snwprintf_s(g_items[i].label, 512, _TRUNCATE, L"%ls：%ls，%ls",
+				pgTxt, g_slots[k].page, g_slots[k].date);
+		else
+			_snwprintf_s(g_items[i].label, 512, _TRUNCATE, L"%ls：%ls", pgTxt, Ph(P_EMPTY));
+	}
 }
 
 static void ScanItems(void)
@@ -1554,9 +1817,18 @@ static void ScanItems(void)
 			   isdigit((unsigned char)g_items[i].name[4]))
 			{
 				slotSeq++;
-				_snwprintf_s(g_items[i].label, 128, _TRUNCATE, L"存档位 %d", slotSeq);
+				// 保底说法：bookmark API 万一拿不到东西，也不至于念出 item00
+				_snwprintf_s(g_items[i].label, 512, _TRUNCATE, Ph(P_SLOT), slotSeq);
 			}
 		}
+		// 再用游戏自己的 API 补上「有没有存档 / 章节名 / 日期」
+		EnrichSaveSlots();
+		// 同名层在不同界面含义不同：`back` 在设置界面/回忆界面是「回到游戏」，
+		// 在读档界面实测是「回到标题界面」（截图核对）。从哪个界面进来会决定它回哪儿，
+		// 插件判不出来，所以这里用一个两种情况下都不算错的说法。
+		for(int i = 0; i < g_itemCount; i++)
+			if(_stricmp(g_items[i].name, "back") == 0)
+				wcsncpy_s(g_items[i].label, 512, L"返回", _TRUNCATE);
 	}
 
 	// 选项场景：选项按钮图层的层名是日文的（「選択肢ボタン」+ 选项原文），
@@ -1674,7 +1946,7 @@ static void WakeToolbar(void)
 
 static void NavAnnounce(const wchar_t *prefix)
 {
-	if(g_itemCount == 0) { SpeechSpeak(L"当前界面上没有可操作的项目。", true); return; }
+	if(g_itemCount == 0) { SpeechSpeak(Ph(P_NOITEM), true); return; }
 	if(g_sel < 0) g_sel = 0;
 	if(g_sel >= g_itemCount) g_sel = g_itemCount - 1;
 	g_slidePct = 50;   // 换了控件，滑条百分比从头开始
@@ -1690,12 +1962,12 @@ static void NavExit(bool announce)
 	g_nav = false;
 	g_scanPending = false;
 	g_itemCount = 0;
-	if(announce) SpeechSpeak(L"已退出导航模式。", true);
+	if(announce) SpeechSpeak(Ph(P_NAV_EXIT), true);
 }
 
 static void NavEnter(void)
 {
-	if(!g_gameWnd) { SpeechSpeak(L"还没有找到游戏窗口，请稍后再试。", true); return; }
+	if(!g_gameWnd) { SpeechSpeak(Ph(P_NO_WINDOW), true); return; }
 	diag("NavEnter\n");
 	WakeToolbar();
 	g_nav = true;
@@ -1705,7 +1977,7 @@ static void NavEnter(void)
 	g_scanOnEnter = true;
 	g_scanPending = true;
 	g_scanAt = GetTickCount() + 400;   // 等工具栏滑出来再扫
-	SpeechSpeak(L"导航模式。", true);
+	SpeechSpeak(Ph(P_NAV_ENTER), true);
 }
 
 static void NavActivate(void)
@@ -1721,7 +1993,7 @@ static void NavActivate(void)
 		return;
 	}
 	wchar_t say[600];
-	_snwprintf_s(say, 600, _TRUNCATE, L"已激活 %ls", it->label);
+	_snwprintf_s(say, 600, _TRUNCATE, Ph(P_ACTIVATED), it->label);
 	SpeechSpeak(say, true);
 	diag("activate "); diagW(it->label);
 	ClickLogical(it->hx, it->hy);
@@ -1747,8 +2019,8 @@ static void SkipStop(const wchar_t *say)
 static void SkipStart(void)
 {
 	if(g_skip) return;
-	if(g_nav) { SpeechSpeak(L"导航模式下不启动快进。", true); return; }
-	if(!g_lastText[0]) { SpeechSpeak(L"现在没有剧情文本，快进没有启动。", true); return; }
+	if(g_nav) { SpeechSpeak(Ph(P_SKIP_NONAV), true); return; }
+	if(!g_lastText[0]) { SpeechSpeak(Ph(P_SKIP_NOTEXT), true); return; }
 	g_skip = true;
 	g_skipBegan = GetTickCount();
 	g_skipNext = g_skipBegan + SKIP_PROBE_MS;
@@ -1758,7 +2030,7 @@ static void SkipStart(void)
 	wcsncpy_s(g_skipWatch, 512, g_lastText, _TRUNCATE);
 	if(g_hWnd) SetTimer(g_hWnd, TIMER_POLL, SKIP_POLL_MS, NULL);
 	diag("skip start\n");
-	SpeechSpeak(L"快进开始，遇到选项会停下来。", true);
+	SpeechSpeak(Ph(P_SKIP_START), true);
 }
 
 static void SkipTick(void)
@@ -1771,7 +2043,7 @@ static void SkipTick(void)
 		// 松手：播报结束，并把当前这一句读出来（快进期间过路台词是不念的，
 		// 不补这一下，盲人松开 Ctrl 后会不知道自己停在哪）
 		bool spoke = g_skipConfirmed;
-		SkipStop(spoke ? L"快进结束。" : NULL);
+		SkipStop(spoke ? Ph(P_SKIP_END) : NULL);
 		if(spoke && g_lastText[0]) SpeakLine(g_lastName, g_lastText);
 		return;
 	}
@@ -1790,10 +2062,10 @@ static void SkipTick(void)
 	{
 		// 试推期推不动 = 根本不在剧情里（读档画面的存档格正好压在推进点上，
 		// 连点可能变成双击 → 读档），所以试推只允许点 SKIP_PROBE_TRIES 下就收手。
-		SkipStop(g_skipConfirmed ? L"推进不动了，快进停止。" : L"现在好像不在剧情里，快进没有启动。");
+		SkipStop(g_skipConfirmed ? Ph(P_SKIP_STUCK) : Ph(P_SKIP_NOTADV));
 		return;
 	}
-	if(g_skipClicks >= SKIP_MAX_CLICKS) { SkipStop(L"快进结束。"); return; }
+	if(g_skipClicks >= SKIP_MAX_CLICKS) { SkipStop(Ph(P_SKIP_END)); return; }
 
 	// 引擎自己把推进节流在 ~2.5 句/秒（实测：点 17.8 下/秒也只到 2.3 句/秒，
 	// 而采样器是 5 Hz —— 引擎若真更快，每次采样都会看到新行）。所以**不要**多发点击，
@@ -1828,7 +2100,7 @@ static void SelectChoice(int i)
 {
 	if(i < 0 || i >= g_choiceCount) return;
 	wchar_t say[256];
-	_snwprintf_s(say, 256, _TRUNCATE, L"已选择 %ls", g_choiceLabels[i]);
+	_snwprintf_s(say, 256, _TRUNCATE, Ph(P_SELECTED), g_choiceLabels[i]);
 	wcsncpy_s(g_lastAnnounced, 4600, say, _TRUNCATE);
 	SpeechSpeak(say, true);
 	ClickLogical(g_choiceRect[i][0] + g_choiceRect[i][2] / 2,
@@ -1860,7 +2132,7 @@ static bool NavKeyDown(WPARAM vk, bool repeat)
 	if(vk == VK_BACK)
 	{
 		if(g_lastAnnounced[0]) SpeechSpeak(g_lastAnnounced, true);
-		else SpeechSpeak(L"还没有朗读过内容。", true);
+		else SpeechSpeak(Ph(P_NOTHING_READ), true);
 		return true;
 	}
 	// 选项场景：数字键 1..9 = 选择对应选项（用游戏自己的按钮矩形点击）
@@ -1920,12 +2192,12 @@ static bool NavKeyDown(WPARAM vk, bool repeat)
 	{
 		if(g_itemCount == 0) return true;
 		NavItem *it = &g_items[g_sel];
-		if(!IsSlider(it->name)) { SpeechSpeak(L"这一项不能用左右方向键调整。", true); return true; }
+		if(!IsSlider(it->name)) { SpeechSpeak(Ph(P_SLIDER_NO), true); return true; }
 		g_slidePct += (vk == VK_RIGHT) ? 10 : -10;
 		if(g_slidePct < 0) g_slidePct = 0;
 		if(g_slidePct > 100) g_slidePct = 100;
 		wchar_t say[64];
-		_snwprintf_s(say, 64, _TRUNCATE, L"已调到百分之 %d", g_slidePct);
+		_snwprintf_s(say, 64, _TRUNCATE, Ph(P_SLIDER_PCT), g_slidePct);
 		SpeechSpeak(say, true);
 		ClickLogical(it->left + it->w * g_slidePct / 100, it->top + it->h / 2);
 		return true;
@@ -1994,13 +2266,13 @@ static void NavTick(void)
 			// 停在第一条会让盲人从几十句之前开始听）
 			if(g_isBacklog && g_histCount > 0) g_sel = g_histCount - 1;
 			wchar_t pfx[64];
-			_snwprintf_s(pfx, 64, _TRUNCATE, L"导航模式，共 %d 项，", g_itemCount);
+			_snwprintf_s(pfx, 64, _TRUNCATE, Ph(P_NAV_ON), g_itemCount);
 			g_scanOnEnter = false;
 			NavAnnounce(pfx);
 		}
 		else if(changed)
 		{
-			NavAnnounce(L"界面已更新，");
+			NavAnnounce(Ph(P_UPDATED));
 		}
 	}
 }
@@ -2109,6 +2381,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 	g_doTryBlock          = (DoTryBlockFn)funcs[4];
 	diagf("dispatch=%p execScript=%p allocStr=%p doTry=%p\n", funcs[0], funcs[2], funcs[3], funcs[4]);
 	if(!g_executeScript || !g_allocVariantString || !g_doTryBlock) { diag("engine entry points missing\n"); return E_FAIL; }
+	DetectLanguage();   // 函数指针就绪后才能问游戏的语言标签
 
 	if(SpeechInit())
 	{
@@ -2117,7 +2390,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 			wchar_t hello[256];
 			wchar_t wname[128];
 			utf8ToW(g_backendName, wname, 128);
-			_snwprintf_s(hello, 256, _TRUNCATE, L"无障碍模块已加载，语音后端 %s", wname);
+			_snwprintf_s(hello, 256, _TRUNCATE, Ph(P_LOADED), wname);
 			SpeechSpeak(hello, true);
 		}
 	}
