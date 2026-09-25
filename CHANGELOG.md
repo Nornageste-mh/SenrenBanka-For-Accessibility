@@ -1,5 +1,35 @@
 # 变更记录
 
+## 0.0.0.5
+
+把**英文**的设置界面补上（日文在 0.0.4 已做）。动作名四语早已自动解决，
+这一版补的是菜单栏供不上的那部分：设置界面各页的选项行、存档界面、底部按钮。
+
+**`data/a11y_labels_en.ini`**
+
+- 取证方法同日文：把界面语言切到 English，逐屏截图对着控件坐标逐项抄（`en_02_set0..7`、
+  `en_03_save`、`en_00_title`），**不是翻译**。
+- 覆盖：8 个页签 + Display / General 1 / General 2 / Text / Sound / Dialog 六页的全部选项行、
+  Mouse 页的命令面板 20 格、Shortcuts 页里菜单栏供不上的三组（ctrl / hide / volume）、
+  存档界面、底部按钮（`back=Return` / `title=Title Screen` / `reset=Defaults`）。
+- 实机验证：`a11y_labels: 共 N 条（lang=en）`，页签念出
+  `Display / General 1 / General 2 / Text / Sound / Dialog / Mouse / Shortcuts`，
+  Shortcuts 页念出 `Save primary key / Ctrl skip primary key …`。
+  （`Save` 来自菜单 caption，`Ctrl skip …` 来自这份表 —— 两条来源都生效。）
+
+**故意没写的两处（宁可缺，不编）**
+
+- `ch6` / `sysvo6`（駒川 みづは）：英文截图里那一格没看清，**不写**，保持中文退回，
+  等重新截图确认再补。日文那边是有依据的（`ch6 = 駒川 みづは`），所以映射本身确定，
+  缺的只是英文拼写。
+- `home` / `end` / `slider`（回忆界面的滚动控件）：没有英文截图证据，同样不写。
+
+**已知未完成**
+
+- **繁体（tw）表还没出。** 方法已经跑通：`tools\capture_ui.ps1 -Tag tw` 抓 12 张 → 逐屏抄。
+  另外繁体**不能**用 `StrConv` 生成（会把「游戲」转成「游戲」，应为「遊戲」）。
+- 自定义按钮排列界面（`item0-19` / `pad0-18` / `func0-19`）四语都还是中文位置说法。
+
 ## 0.0.0.4
 
 控件标签跟着游戏语言走。上一版只让**插件自己的话术**跟语言走，控件标签仍是写死的中文。
