@@ -649,22 +649,15 @@ static const UiPhrase g_phrases[P_COUNT] = {
 	/* P_SLIDER_PCT    */ { L"%d パーセントに設定しました", L"Set to %d percent", L"已调到百分之 %d", L"已調到百分之 %d" },
 	/* P_NO_WINDOW     */ { L"ゲームウィンドウが見つかりません。後でもう一度お試しください。", L"Game window not found; please try again later.", L"还没有找到游戏窗口，请稍后再试。", L"還沒有找到遊戲視窗，請稍後再試。" },
 	/* P_NOTICE        */ {
-		L"注意。本作品はフィクションです。登場人物・団体名・地名・設定などはすべて架空で、"
-		L"現実とは関係ありません。本作品は YUZOSOFT の著作物であり、無断での複製・改変・録音・"
-		L"レンタル・配布・放送などを禁じます。登場するキャラクターはすべて 18 歳以上です。"
-		L"スペースか Enter で続けます。",
-		L"Notice. This work is fiction. All characters, organizations, place names and settings are "
-		L"fictional and unrelated to reality. This work is the property of YUZOSOFT; unauthorized "
-		L"copying, modification, recording, rental, distribution or broadcast is prohibited. "
-		L"All characters are over 18. Press Space or Enter to continue.",
-		L"注意。本作品纯属虚构，登场人物、团体名、地名、设定等全部为虚构，与现实毫无关联。"
-		L"本作品是柚子公司（YUZOSOFT）的著作，未经许可禁止将本作品中的内容进行复制、修改、"
-		L"录音、租赁、发布、播出。本作品中出现的所有角色年龄均已超过 18 周岁。"
-		L"按空格或回车继续。",
-		L"注意。本作品純屬虛構，登場人物、團體名、地名、設定等全部為虛構，與現實毫無關聯。"
-		L"本作品是柚子公司（YUZOSOFT）的著作，未經許可禁止將本作品中的內容進行複製、修改、"
-		L"錄音、租賃、發布、播出。本作品中出現的所有角色年齡均已超過 18 週歲。"
-		L"按空格或 Enter 繼續。" },
+		// 这里**故意不照抄游戏自己的声明原文**，只用我们自己的话说明「现在是什么画面、
+		// 按什么键过去」。理由见 README「内容边界」：那份声明是柚子社的文本，
+		// 而且它本来就是一张预渲染图片、屏幕阅读器取不到，我们只需要给一个功能提示。
+		L"この画面には、読み上げられないお知らせが表示されています。"
+		L"スペースか Enter で先に進みます。",
+		L"This screen shows a notice that cannot be read out. "
+		L"Press Space or Enter to continue.",
+		L"当前画面是一段无法朗读的声明。按空格或回车继续。",
+		L"目前畫面是一段無法朗讀的聲明。按空格或 Enter 繼續。" },
 	/* P_NOTHING_READ  */ { L"まだ何も読み上げていません。", L"Nothing has been read yet.", L"还没有朗读过内容。", L"還沒有朗讀過內容。" },
 	/* P_LOADED        */ { L"アクセシビリティモジュールを読み込みました。音声バックエンド %s", L"Accessibility module loaded. Speech backend: %s", L"无障碍模块已加载，语音后端 %s", L"無障礙模組已載入，語音後端 %s" },
 	/* P_KEY1          */ { L"主キー", L"primary key", L"主键", L"主鍵" },
@@ -906,8 +899,9 @@ static void PollDialogue(void)
 		"    }"
 		"  }"
 		"} catch(e) { __r = \"\"; }"
-		// 启动时的「注意」声明画面是一张整屏图片（image/attention_cn.png），挂在
-		// SysCoverLayer 上，没有任何文本可读，所以由驱动层自己念一段固定说明。
+		// 启动时的「注意」声明画面是一张整屏图片（image/attention_cn.png，按语言分版本），
+		// 挂在 SysCoverLayer 上，没有任何文本可读，所以由驱动层自己念一句功能提示
+		// （*不是*复述声明内容，理由见 README「内容边界」与 P_NOTICE 处的注释）。
 		"var __cv=\"0\";"
 		"try{var __pl=global.kag.getPrimaryLayerAt(960,540);"
 		"if(__pl!=void){var __pn=\"\"+__pl.name;if(__pn==\"SysCoverLayer\")__cv=\"1\";}}catch(z0){}"
@@ -1693,11 +1687,10 @@ static void LabelOf(const char *name, wchar_t *out, int cap)
 //
 // 【实测依据】历史记录界面（kag.historyLayer）上：
 //   · `historyLayer.data` 是一个 Array，实测 length=25，一条一句已读台词；
-//   · 每条 `data[i]` 上，`.text` 是**本地化后的中文**、`.plaintext` 是**日文原文**
-//     （实测 data[20].text=「竟然专门跑到这犬魂作祟的地方来看庆典……」、
-//      data[20].plaintext=「わざわざイヌツキの土地に祭りを見に来たなんて……」，
-//      与截图上那 5 行完全一致）。
-//   · 界面上那 5 个正文块层的 `blockInfo.text` **只有日文**，所以正文一律走 data，
+//   · 每条 `data[i]` 上，`.text` 是**本地化后的译文**、`.plaintext` 是**原文**
+//     （实测同一条记录上两个字段语言不同，且与画面上对应的正文块逐字一致；
+//      具体台词内容不入库，见 README「内容边界」）。
+//   · 界面上那 5 个正文块层的 `blockInfo.text` **只有原文一种语言**，所以正文一律走 data，
 //     不走 blockBaseLayer 的子层 —— 那条路是死路，已实测否掉。
 //   · 选项行会让 .text/.plaintext 语义对调，所以沿用当前台词那条**假名判据**来挑。
 static const char *kHistScript =
