@@ -70,20 +70,50 @@
 
 ## 安装（仅限正版玩家）
 
-游戏**不会自动加载 `.tpm`**，本作是靠启动脚本里的一句 `Plugins.link("a11y.dll")` 拉起来的，
-所以安装需要把一个启动槽位替换掉（原理见 `docs/DESIGN.md`）。把产物放进游戏的 `plugin\` 目录：
+安装 = **替换 `data.xp3`** + 往 `plugin\` 放几个文件。
+
+**为什么非得替换 `data.xp3`**：本作引擎不会自动加载 `plugin\*.dll`，
+插件必须由脚本显式 `Plugins.link("a11y.dll")` 拉起；而唯一能保证在插件加载前
+执行到我们代码的位置，就是 `data.xp3` 里的 `startup.tjs` 槽位。
+外挂补丁档（`a11y.xp3` / `patch0.xp3` / `patch.xp3` / `patch_extra.xp3`）
+与散装同名脚本我们**全部实测过，一个都不生效**，清单见 `docs/DESIGN.md` 第 16 节。
+
+**请先备份你自己的 `data.xp3`**（约 985 MB，改名为 `data.xp3.bak` 即可）——
+这是唯一的还原手段。
 
 ```
+<游戏目录>\data.xp3                                ← 替换（用发布包里的那份）
 <游戏目录>\plugin\a11y.dll
-<游戏目录>\plugin\nvdaControllerClient.dll     ← NV Access 官方 x86 版，需自行获取
-<游戏目录>\plugin\a11y_labels.ini              ← 可选，覆盖内置标签表
+<游戏目录>\plugin\nvdaControllerClient.dll         ← NV Access 官方 x86 版（随发布包含）
+<游戏目录>\plugin\a11y_labels.ini                  ← 可选，覆盖内置标签表
+<游戏目录>\plugin\a11y_labels_{jp,en,tw}.ini       ← 可选，其它语言的标签表
 ```
 
-`tools\install_when_closed.ps1` 是个省事的小脚本：等游戏退出（DLL 被占用时换不了），
-换掉文件，再重新启动。
+发布包在 GitHub Releases 里（`SenrenBankaForAccessibility-<版本>.7z`），
+已含上述全部文件与第三方许可证。解压覆盖即可。
 
-**还原**：补丁不改动游戏本体逻辑，还原就是删掉上面三个文件、恢复启动脚本。
-完整步骤见 `docs/RESTORE.md`。
+### 自己构建这个被替换的 data.xp3
+
+如果你手上有游戏原档，可以自己生成，不用下别人的：
+
+```cmd
+rem 1) 编译启动脚本（tjs2c 需要 32 位的 tjs2 工具链）
+tjs2c.exe data\startup.tjs startup.raw.bin
+
+rem 2) 注入。源用**原始** data.xp3，输出另存一个文件
+python tools\inject_boot.py --data "<游戏目录>\data.xp3" ^
+                            --bin startup.raw.bin ^
+                            --out "<游戏目录>\data.patched.xp3"
+```
+
+`tools\inject_boot.py` 只有标准库依赖。它只替换 `startup.tjs` 一个条目，
+其余内容原样拷贝，内层索引**逐字节照抄** —— 这一条是硬约束，
+重建索引会静默丢文件（见 `docs/DESIGN.md` 第 16 节）。
+
+## 还原
+
+把 `data.xp3.bak` 改回 `data.xp3`，再从 `plugin\` 删掉那几个文件。
+补丁不改动游戏本体逻辑，**不会留下任何残留**。完整步骤见 `docs/RESTORE.md`。
 
 ## 主要快捷键
 

@@ -1,5 +1,67 @@
 # 变更记录
 
+## 0.1.0.2
+
+**把发布方式定下来：替换 `data.xp3`。** 代码没改，改的是「怎么装」这件事被彻底查清并写死。
+
+**为什么必须替换 `data.xp3`**
+
+本作激活插件的唯一方式，是在 `data.xp3` 里的 `startup.tjs` 槽位挂一句
+`Plugins.link("a11y.dll")`。为了给出一个「用户不用改 1 GB 归档」的安装方式，
+把非破坏性的路子探到底，**实测十三种，全部失败**：
+
+| 思路 | 结果 |
+|---|---|
+| 散装 `startup.tjs`（编译字节码 XOR 0x01） | ✗ 引擎不在文件系统里找启动脚本 |
+| 散装 `startup.tjs`（明文 TJS2100） | ✗ 同上 |
+| 外挂 `a11y.xp3`（自建魔改格式档） | ✗ 不加载 |
+| 外挂 `a11y.xp3`（补上 48 字节诱饵 PNG 修正布局） | ✗ 不加载 |
+| `patch0.xp3`（`Initialize.tjs` 循环里的槽位） | ✗ 不加载 |
+| `patch.xp3`（占位官方槽） | ✗ 不加载 |
+| `patch.xp3` 注入官方档（保住签名） | ✗ 不加载 |
+| `patch_extra.xp3` 新增 `startup.tjs` | ✗ 不加载 |
+
+**反向证据更有说服力**：`patch.xp3` 里的 `Config.tjs` / `hotfix.tjs` 是**生效的**，
+说明官方补丁档确实被加载；可一旦换成我们改过的那份就不行了。
+所以这不是「签名拦截」——被改过的 `data.xp3` 照样能加载，**证明引擎不校验 `.sig`**。
+
+**启动脚本是自己重写的，不是抄的**
+
+`src/` 之外新增 `data/startup.tjs`：语义与原版一致（两个只读 getter
+`inXP3archivePacked`=1 / `convertMode`=0、计算 `kirikiriz` 与 `debugWindowEnabled`、
+`Scripts.exec("@set(PACKED=1)@set(DEBUG=…")`、最后 `Scripts.execStorage("system/Initialize.tjs")`），
+**额外只加一句 `Plugins.link("a11y.dll")`，并且包在 `try` 里** ——
+插件或它的依赖缺失时游戏照常启动，只是没有无障碍层。不要让一个插件把整个游戏挡在门外。
+
+编译用 `tjs2c`（32 位 tjs2 工具链），落盘字节流 **XOR 0x01**
+（头部 `TJS2100` ↔ `UKR3011`）。注：`tjs2c` 不支持 `as integer` 转换，
+写成它支持的等价形式才能过编译。
+
+**注入工具**
+
+`tools/inject_xp3.py`：源用**原始 `data.xp3`**，内层 `hnfn` 索引**逐字节照抄**
+（绝不重建 —— 重建会丢同名哈希组），只替换 `startup.tjs` 一个条目，
+并沿用该条目原本的 XOR key。实测 **4.5 秒**完成，产物约 985 MB。
+
+**产物核对（这次做了）**
+
+替换后的 `data.xp3` 与原档逐条对比：**内层索引 1277 个条目，集合与顺序完全一致**，
+一个都没丢。体积比原档大 26 MB —— 那是重写段时的 zlib 压缩差异，不是内容变化。
+
+**发布包**
+
+`SenrenBankaForAccessibility-0.1.0.1.7z`，**633 MB**（985 MB 经 7-Zip 9 级极限压缩，
+含 `data.xp3` + `plugin\` 6 个文件 + 许可证 + 说明）。
+`nvdaControllerClient.dll` 取 **NV Access 官方 `nvda_2026.2_controllerClient.zip` 的 x86**，
+**LGPL-2.1**（许可证原文随包），上游 readme 明确允许随应用分发；本补丁运行时
+`LoadLibrary` 加载它，所以用户可自行替换 —— 满足 LGPL 的「可替换」要求。
+
+**已知不足**
+
+- 用户必须先备份自己的 `data.xp3`（985 MB）。这是唯一的还原手段。
+- 安装方式对用户是「下载 633 MB 并覆盖一个 985 MB 文件」，体验偏重；
+  如果将来找到非破坏性通道，应立刻改掉。
+
 ## 0.1.0.1
 
 **合规复查，外加两处与事实不符的说法。** 功能一行没改，但有**一处文本改动 + 一次重新构建**，
