@@ -1,0 +1,19 @@
+# 行尾统一：源码与文档走 LF，Windows 脚本走 CRLF
+* text=auto
+*.cpp text eol=lf
+*.h   text eol=lf
+*.def text eol=lf
+*.md  text eol=lf
+*.ini text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制/资源类一律按二进制处理（正常情况下也不会入库）
+*.dll binary
+*.png binary
+*.ogg binary
+
+# 第三方头文件必须**逐字节原样**：关掉一切行尾/编码转换。
+# 这一条放在 *.h 之后，后匹配者生效。
+third_party/** -text

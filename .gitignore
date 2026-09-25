@@ -1,0 +1,103 @@
+# ============================================================================
+#  本仓库**只**放模式自己的源码与文档。
+#  任何涉及开发商/发行商利益的内容一律禁止入库：
+#  游戏资源、游戏脚本、解密/解包工具、反汇编产物、剧情文本、截图、存档。
+#  下面这些规则是**兜底**：就算误敲了 `git add .`，也不会把东西提交上去。
+# ============================================================================
+
+# ---- 游戏本体与资源 ----
+senren-banka-copy/
+*.xp3
+*.xp3.*
+*.sig
+*.exe
+*.cf
+*.dll
+steam_appid.txt
+savedata/
+
+# ---- 游戏脚本 / 剧情（含已解密、已编译形式）----
+*.ks
+*.scn
+*.psb
+*.func
+*.tjs
+*.asd
+
+# ---- 音视频 / 图片资源 ----
+*.ogg
+*.wav
+*.mp3
+*.wmv
+*.png
+*.jpg
+*.jpeg
+*.pimg
+*.mtn
+*.sli
+*.tft
+*.otf
+*.ttf
+shots/
+
+# ---- 逆向 / 解包 / 分析脚本与它们的产物 ----
+krkr_extract.py
+psb_dec.py
+scan_names.py
+extract_scn.py
+extract_tjs.py
+get_lang.py
+drive.ps1
+autoadvance.ps1
+sendkey_real.ps1
+tools/dec/
+tools/scn/
+tools/scn_dec/
+tools/lang/
+tools/ks/
+tools/tjsdis2/
+tools/patch/
+
+# ---- 第三方引擎源码（TJS2 / krkrz，BSD，但不随本仓库分发）----
+tjs*.cpp
+tjs*.h
+uni_cp932.*
+cp932_uni.*
+*.tab.cpp
+*.tab.hpp
+
+# ---- 构建产物 ----
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.res
+build_log*.txt
+
+# ---- 日志与探针输出（可能夹带剧情文本）----
+*_diag.txt
+*_res.txt
+sba11y_cmd.txt
+*_report.txt
+keys_*.txt
+boot_link.txt
+pipe_*.txt
+a11y_load.txt
+
+# ---- 编辑器 / 系统杂物 ----
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+*.swp
+
+# ============================================================================
+#  例外：third_party/ 下是**引擎**的代码，不是游戏的内容。
+#  它是 W.Dee 的 TJS2 / 吉里吉里，许可明确允许「流用」（嵌入别的软件），
+#  义务只是在文档里注明 —— 见 third_party/README.md 与随附的许可证原文。
+#  为了「拿到源码就能编出一样的产物」，这一小撮头文件必须随仓库走。
+#  注意：这里放行的**只有** third_party/ 下的文件，游戏内容照旧全挡。
+# ============================================================================
+!third_party/
+!third_party/**
