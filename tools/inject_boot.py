@@ -174,14 +174,18 @@ def main():
                 cur += arc
         new_outers.append(bytes(fc))
 
-    inner_z = zlib.compress(inner)                    # 内层索引逐字节照抄
+    # 内层索引逐字节照抄（重新压缩，但内容与顺序不变）。
+    # 用级别 6 —— 与 C# 版 tools/inject_boot.cs 保持一致，两者产物可逐字节对比。
+    # 级别 9 会省几百字节，但 .NET 的 DeflateStream 达不到那个压缩率，
+    # 两边级别不同就没法互相校验了，不值得。
+    inner_z = zlib.compress(inner, 6)
     inner_off = cur
     out.write(inner_z)
     new_outer = (b'sen:' + struct.pack('<Q', 40) + struct.pack('<Q', inner_off)
                  + struct.pack('<II', len(inner), len(inner_z)) + struct.pack('<H', 10)
                  + b'CSK\x60\x0a\xff\x07\x4e\xb1\x82' + 'Steam'.encode('utf-16le') + b'\x00\x00'
                  + b''.join(new_outers))
-    outer_z = zlib.compress(new_outer)
+    outer_z = zlib.compress(new_outer, 6)
     tail = struct.pack('<BQQ', 1, len(outer_z), len(new_outer)) + outer_z
     tail_off = inner_off + len(inner_z)
     out.write(tail)
