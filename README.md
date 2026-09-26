@@ -5,7 +5,7 @@
 文字直接交给读屏 DLL（Tolk / NVDA Controller Client / Windows SAPI），
 界面用键盘导航，通过向游戏自己的派发发真实鼠标点击来实现。
 
-- 当前版本：**0.1.0.1**（见 `CHANGELOG.md`）
+- 当前版本：**0.1.0.4**（见 `CHANGELOG.md`）
 
 > ## 🎮 关于本作
 >
