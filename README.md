@@ -341,14 +341,10 @@ build\build.cmd
 
 ## 许可
 
-尚未授予任何许可（个人无障碍项目）。第三方依赖各自的许可见上表与 `third_party/README.md`。
+本仓库的**补丁代码与文档**采用 [MIT 许可](LICENSE) 发布；
+附加的署名要求、非官方声明与免责条款见 [NOTICE.md](NOTICE.md)。
 
----
-
-## 许可证
-
-本仓库的**代码与文档**采用 [MIT 许可](LICENSE) 发布。
-附加的**署名要求、非官方声明与免责条款**见 [NOTICE.md](NOTICE.md)。
+第三方依赖各自的许可见上表、`third_party/README.md` 与 [NOTICE.md](NOTICE.md)。
 
 简要说明：
 
