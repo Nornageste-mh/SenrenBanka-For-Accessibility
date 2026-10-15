@@ -2,10 +2,10 @@
 
 本仓库是**专门针对 Steam 游戏《千恋＊万花》（Senren＊Banka，AppID 1144400）** 的屏幕阅读器
 辅助补丁 —— 一个游戏内 **krkrz / 吉里吉里 Z 的 V2Link 插件**（`a11y.dll`），
-文字直接交给读屏 DLL（Tolk / NVDA Controller Client / Windows SAPI），
+文字直接交给读屏 DLL（Tolk / NVDA Controller Client / 争渡读屏 ZDSR / Windows SAPI），
 界面用键盘导航，通过向游戏自己的派发发真实鼠标点击来实现。
 
-- 当前版本：**0.1.0.4**（见 `CHANGELOG.md`）
+- 当前版本：**0.1.0.5**（见 `CHANGELOG.md`；这一版标为 **pre-release** —— 代码与自检都过了，但**尚未在游戏里实机验证**）
 
 > ## 🎮 关于本作
 >
@@ -65,6 +65,9 @@
 - 界面控件可用方向键浏览、`Enter` 激活。
 - 界面标签跟着**游戏的界面语言**走（游戏有三套语言设置：主要语言、字幕语言、界面语言，
   控件跟的是第三套）。
+- 语音后端按 `Tolk` → `NVDA` → `争渡读屏（ZDSR）` → `SAPI` 逐级降级；
+  按 `F9` 可以在**当前可用**的后端之间循环切换（下次启动保持），详见
+  [语音后端与切换快捷键](#语音后端与切换快捷键)。
 
 **平台**：Windows x86。游戏是 32 位进程，所以补丁和 `nvdaControllerClient.dll` 都必须是 32 位。
 
@@ -140,8 +143,42 @@ python tools\inject_boot.py --data "<游戏目录>\data.xp3" ^
 | `Backspace` | 重读上一句 |
 | `1`–`9` | 选项场景：选择对应选项 |
 | `Ctrl`（按住） | 快进；遇到选项自动停手并把选项念出来 |
+| `F9` | 循环切换语音后端（自动 → Tolk → NVDA → 争渡 → SAPI），念出结果；键位可在配置里改 |
 
 游戏本体的原生键位（空格/回车推进、`R` 开历史、按住 `Ctrl` 快进）**不动**，补丁不去抢占。
+
+### 语音后端与切换快捷键
+
+补丁启动时按 `Tolk` → `NVDA` → `争渡读屏（ZDSR）` → `SAPI` 的顺序找后端，
+找到一个就用；任一级失败都只降级，不报错、不中止。
+
+- **争渡排在 NVDA 之后、SAPI 之前**：原来用 Tolk/NVDA 的机器行为完全不变，
+  只装争渡的机器才落到这一级（这类机器过去在三级链上大概率一片安静）。
+- **争渡的可用性判据是 `GetSpeakState()` ∈ {3 正在朗读, 4 空闲}，不是 `Speak()` 的返回值** ——
+  未授权时 `Speak()` 照样返回 0，只看它就会「插件自称正常、玩家一声不响」。
+- 争渡的 dll **不由本补丁分发、也不复制到游戏目录**：按官方要求直接读争渡安装目录那份
+  （`%ProgramFiles(x86)%\zdsr\zdsr\ZDSRAPI.dll`，其次 `%ProgramFiles%\zdsr\zdsr\`，
+  再退到游戏目录的 `plugin\` 与根目录）。官方明确不建议自带 dll —— 版本旧了会「版本不匹配」。
+- `F9` = 循环切换：**自动** → `Tolk` → `NVDA` → `争渡` → `SAPI` → 回到**自动**。
+  **当前不可用的后端会被跳过**，并在播报里说明跳过了哪些；结果用**新后端**念出来；
+  选「自动」时会连当前实际用的是谁一起念（例：`语音后端：自动（当前 SAPI）`）。
+- 切换结果会写回配置文件，下次启动保持。
+
+配置文件 `plugin\a11y_speech.ini`（可选，UTF-8；模板见 `data\a11y_speech.ini`）：
+
+```ini
+key=Alt+Shift+F9     # 与别的软件抢 F9 时改这里；主键限 F1..F24、A..Z、0..9
+backend=auto         # auto / tolk / nvda / zdsr / sapi，也可写「自动」「争渡」
+```
+
+- 键的检测走插件本来就有的 200 ms 定时器（读键状态）：**不要求插件窗口有焦点、也不吞键**
+  （游戏自己若也响应这个键会照旧响应）。只有游戏窗口在前台、且不在快进中时才动作。
+- `backend=` 里写死的后端**当时不可用时会自动回退**到自动链上的其它后端（诊断日志里有一行
+  `指定的语音后端不可用：…`），不会静默变成「没有声音」。
+- 修键位/后端不用重新编译：改 `key=` 之后重开游戏生效；`backend=` 一行由插件自己维护。
+- **未实机验证**：本机没有启动游戏，所以「争渡在真实游戏进程里真的出声」这一条**没有验证过**。
+  已验证的是 32 位构建、导出表，以及用桩 DLL 机械跑通的加载顺序、可用性判据、
+  文本与打断标记透传、失败降级（`tools\zdsr_selftest\`）。
 
 ## 已知问题 / 注意事项
 
@@ -152,6 +189,9 @@ python tools\inject_boot.py --data "<游戏目录>\data.xp3" ^
 - 存档界面的翻页按钮、自定义按钮排列界面、记忆界面的部分按钮，
   标签还不是四语齐全，退回中文或位置说法。
 - **破坏性控件（读档 / 删除存档）尚未加二次确认。**
+- **语音后端切换（`F9`）与争渡后端尚未实机验证**：本机不启动游戏，所以「听到的声音」
+  这一条没有验证过。已验证的是 32 位构建、导出表，以及用桩 DLL 跑通的选路与失败路径
+  （`tools\zdsr_selftest\`，33 项断言）。
 - 补丁的文字是**逐屏实机截图取证**来的，不是从游戏资源里解出来的。
   取证方法不给结论，只给做法，见 `docs/DESIGN.md`。
 
@@ -167,6 +207,22 @@ build\build.cmd
 
 产物是 `a11y.dll`（导出 `V2Link` / `V2Unlink` / `GetModuleThreadModel`）。
 想改用自己的一份头文件，设 `TJS_INC` 覆盖即可。
+
+构建脚本**强制 32 位**：先用 `vcvars32.bat` 设下的 `VSCMD_ARG_TGT_ARCH` 判一次，
+链接时再带 `/MACHINE:X86`。用 64 位环境跑会**直接失败**，
+而不是像以前那样报 `BUILD_OK` 却产出一个装不上的 x64 DLL。
+
+ZDSR 后端的机械自检（可选，需要同一套 32 位 MSVC）：
+
+```cmd
+tools\zdsr_selftest\build_and_run.cmd
+```
+
+它会自己编一个桩 `ZDSRAPI.dll`（返回码由环境变量控制、逐次调用写日志），
+再跑 32 位断言程序，覆盖「dll 不存在 / 未授权(state=2) / 正在朗读(3) / 空闲(4) /
+`Speak` 返回 2 / 中途掉线 / 缺导出」，最后对**真安装目录那份 dll** 做一次**只读**握手
+（`InitTTS` + `GetSpeakState`，不调用 `Speak`）。报告写在仓库根的
+`zdsr_selftest_report.txt`（已在 `.gitignore` 里）。
 
 ### 构建是可复现的
 
@@ -188,17 +244,20 @@ build\build.cmd
 ### 目录结构
 
 ```
-build/build.cmd          构建脚本（cmd.exe，ASCII only）
+build/build.cmd          构建脚本（cmd.exe，ASCII only；会校验 32 位目标）
 src/a11y6.cpp            补丁本体，单文件
 src/a11y6.def            导出表（V2Link / V2Unlink / GetModuleThreadModel）
 src/force.h              强制包含头（关掉一些引擎头的默认行为）
+src/zdsr_api.h           争渡读屏（ZDSR）后端实现（插件与自检**共用同一份**）
 data/a11y_labels*.ini    界面控件标签表（通用 + jp/en/tw 各一份）
+data/a11y_speech.ini     语音后端与切换快捷键的配置模板（可选）
 docs/DESIGN.md           设计说明：怎么做的、凭什么这么做、踩过哪些坑
 docs/RESTORE.md          还原步骤
 third_party/tjs2/        TJS2 / 吉里吉里 接口头文件（11 个）+ 许可证原文
 tools/inject_boot.cs     注入工具源码（编译出发布包里的 注入工具.exe）
 tools/build_injector.ps1 编译上面那个 exe（走 .NET Framework 自带的 csc.exe）
 tools/inject_boot.py     同一套注入逻辑的 Python 版，逐字节等价
+tools/zdsr_selftest/     ZDSR 后端的机械自检（自编桩 DLL + 32 位断言程序）
 tools/                   安装与送键的小脚本
 ```
 
@@ -209,7 +268,8 @@ tools/                   安装与送键的小脚本
    改成游戏自己加载的 V2Link 插件后，文字从游戏进程内直接交给读屏 DLL，
    没有第二份焦点、第二个窗口。
 2. **语音后端链**：`Tolk`（若游戏目录有 `tolk.dll`）→ `nvdaControllerClient.dll`
-   → `SAPI5`（纯 vtable 调用）。任一级失败都只降级，绝不把异常抛回游戏主循环。
+   → 争渡读屏 `ZDSRAPI.dll` → `SAPI5`（纯 vtable 调用）。任一级失败都只降级，绝不把异常抛回游戏主循环。
+   `F9` 可在**当前可用**的后端之间循环切换，选择记在 `plugin\a11y_speech.ini`。
 3. **控件发现**：对 1920x1080 打 40px 网格，逐点问 `kag.getPrimaryLayerAt(x,y)`，
    再枚举子层、按父容器矩形裁剪、按名字与矩形去重。
 4. **标签跟着语言走**：每 0.8 秒检测一次界面语言，玩家中途反复切换也会跟上。
@@ -306,6 +366,7 @@ build\build.cmd
 | TJS2 / 吉里吉里 接口头文件（`third_party\tjs2`，11 个文件） | 吉里吉里自有许可 或 GNU GPL（双许可） | **是**，逐字节原样，许可证原文随附 |
 | `nvdaControllerClient.dll` | NV Access | 否，安装时自取 |
 | Tolk（可选） | LGPL | 否 |
+| 争渡读屏 API（`ZDSRAPI.dll`） | 争渡读屏（第三方商业读屏软件） | 否，运行时按绝对路径读玩家自己装的那份 |
 
 `third_party/` 是这条线**唯一**的开口，而且只开口给引擎代码：那是 W.Dee 的 TJS2 / 吉里吉里，
 **不是 YUZUSOFT 的资产**，许可里明确允许嵌入别的软件。带上它，别人才能拿到源码就编出一样的产物。

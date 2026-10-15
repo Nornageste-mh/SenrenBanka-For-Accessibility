@@ -1,0 +1,8 @@
+; Same as zdsr_stub.def but WITHOUT GetSpeakState - simulates an old/incompatible
+; ZDSRAPI.dll that has the other four exports. Used to check that a missing export
+; is judged "unavailable" instead of crashing or pretending to work.
+EXPORTS
+    InitTTS=_InitTTS@12
+    Speak=_Speak@8
+    StopSpeak=_StopSpeak@0
+    Braille=_Braille@8

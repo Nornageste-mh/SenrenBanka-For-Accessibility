@@ -1,0 +1,11 @@
+; Export table for the ZDSR stub DLL.
+; Names must match the real ZDSRAPI.dll exactly (no x86 "@n" decoration), otherwise
+; GetProcAddress("InitTTS") fails and the self-test would prove nothing.
+; The stub functions are plain __stdcall C functions, so their object-file symbols
+; are decorated; the aliases below are what makes the exported names undecorated.
+EXPORTS
+    InitTTS=_InitTTS@12
+    Speak=_Speak@8
+    GetSpeakState=_GetSpeakState@0
+    StopSpeak=_StopSpeak@0
+    Braille=_Braille@8

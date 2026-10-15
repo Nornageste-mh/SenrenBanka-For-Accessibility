@@ -28,6 +28,14 @@ if not exist "%TJS_INC%\tjsCommHead.h" (
 
 call "%VCVARS%" >nul || exit /b 1
 
+rem vcvars32.bat sets VSCMD_ARG_TGT_ARCH=x86. This guard matters: with a 64-bit
+rem vcvars the build used to succeed and silently emit an x64 DLL that the 32-bit
+rem game cannot load (the symptom would only be "the plugin does nothing").
+if /i not "%VSCMD_ARG_TGT_ARCH%"=="x86" (
+  echo [x] wrong target arch: VSCMD_ARG_TGT_ARCH="%VSCMD_ARG_TGT_ARCH%" - use vcvars32.bat
+  exit /b 1
+)
+
 rem /MT links the CRT statically so we do not add another runtime to the game process
 set CL=/nologo /EHsc /MT /O1 /D_CRT_SECURE_NO_WARNINGS /DTJS_NO_REGEXP /DNDEBUG /DUNICODE /D_UNICODE /D__WIN32__ /utf-8
 set INC=/I"%ROOT%\src" /I"%TJS_INC%"
@@ -39,7 +47,7 @@ del "%LOG%" 2>nul
 cl /c %CL% %INC% %FI% /Fo"%ROOT%\a11y.obj" "%ROOT%\src\a11y6.cpp" >>"%LOG%" 2>&1
 if errorlevel 1 exit /b 1
 
-link /nologo /DLL /OUT:"%ROOT%\a11y.dll" /DEF:"%ROOT%\src\a11y6.def" "%ROOT%\a11y.obj" user32.lib comctl32.lib gdi32.lib >>"%LOG%" 2>&1
+link /nologo /DLL /MACHINE:X86 /OUT:"%ROOT%\a11y.dll" /DEF:"%ROOT%\src\a11y6.def" "%ROOT%\a11y.obj" user32.lib comctl32.lib gdi32.lib >>"%LOG%" 2>&1
 if errorlevel 1 exit /b 1
 
 echo BUILD_OK  -^>  %ROOT%\a11y.dll

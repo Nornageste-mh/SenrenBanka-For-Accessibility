@@ -11,7 +11,12 @@
    <游戏目录>\plugin\a11y.dll
    <游戏目录>\plugin\nvdaControllerClient.dll     ← NV Access 官方 x86 版（读屏桥）
    <游戏目录>\plugin\a11y_labels.ini              ← 可选；覆盖内置标签表，UTF-8
+   <游戏目录>\plugin\a11y_speech.ini              ← 可选；语音后端与 F9 键位，UTF-8
    ```
+
+   争渡读屏（ZDSR）**不需要往这里放任何文件**：插件按官方建议直接读争渡安装目录下的
+   `ZDSRAPI.dll`（`%ProgramFiles(x86)%\zdsr\zdsr\`），装没装、有没有授权由插件自己判，
+   不可用时如实落到下一级后端。
 
 3. 让游戏加载它。本作**不会自动加载 `.tpm`**，需要在启动脚本里加一句
    `Plugins.link("a11y.dll")`（本机做法是替换启动脚本里的一个槽位；这一步与具体打包方式有关，
@@ -19,12 +24,14 @@
 4. 启动游戏。读屏队列里应当念出「无障碍模块已加载，语音后端 …」。
 
 想确认加载成功，看诊断日志：应当出现模块版本行、`a11y_labels.ini: N 条`、
-`语音后端: NVDA`、`game window subclassed hwnd=...`。
+`语音后端: NVDA`（或 `争渡读屏 (ZDSR)` / `SAPI` / `Tolk`）、`game window subclassed hwnd=...`。
+按 `F9` 的切换结果也会记进去（`后端切换 → …`、`a11y_speech.ini: backend=…`）。
 
 ## 还原
 
 1. 关掉游戏。
-2. 删掉 `<游戏目录>\plugin\a11y.dll`、`nvdaControllerClient.dll`、`a11y_labels.ini`。
+2. 删掉 `<游戏目录>\plugin\a11y.dll`、`nvdaControllerClient.dll`、`a11y_labels.ini`、
+   `a11y_speech.ini`（如果放过）。
 3. 把第 3 步改过的启动脚本恢复成原始副本（如果你是按替换槽位的方式做的）。
 
 **改动过游戏归档文件的话**（例如为了塞进启动脚本），从**原始备份**恢复整包，

@@ -29,6 +29,7 @@
 #include "tjsCommHead.h"
 #include "tjsInterface.h"
 #include "tjsVariant.h"
+#include "zdsr_api.h"   // 争渡读屏后端；同一份代码被 tools\zdsr_selftest 复用（见该文件头）
 
 // ---------------------------------------------------------------- exporter ---
 struct iTVPFunctionExporter
@@ -162,12 +163,27 @@ static void diagW(const wchar_t *w) { diagWN(w, -1); diag("\n"); }
 //   3. SAPI   系统语音，纯 vtable 调用，绝不走 COM 后期绑定
 // 任一后端失败都只降级、绝不把异常抛回游戏主循环。
 
-enum Backend { BK_NONE = 0, BK_TOLK, BK_NVDA, BK_SAPI };
+enum Backend { BK_NONE = 0, BK_TOLK, BK_NVDA, BK_ZDSR, BK_SAPI };
 static Backend g_backend = BK_NONE;
 static char    g_backendName[128] = "无";
 static char    g_verdict[512] = "";
 static DWORD   g_nextRetry = 0;
 static const DWORD RETRY_MS = 10000;
+
+// 用户选定的后端（F9 循环切换的结果，也可写在 plugin\a11y_speech.ini 里）。
+// BK_NONE = 自动：不指定，走下面的完整降级链。选了指定后端但它现在不可用时
+// **如实降级回自动链**，绝不假装成功。
+static Backend g_forceBackend = BK_NONE;
+
+// 最近一次「挑后端」跳过了哪几个（供 F9 切换后的播报说清楚「跳过了什么」）。
+// SpeechInit 每次重挑开始时清空，每条后端失败时记一个。
+static Backend g_skipped[8];
+static int     g_skippedCount = 0;
+static void NoteSkipped(Backend b)
+{
+	for(int i = 0; i < g_skippedCount; i++) if(g_skipped[i] == b) return;
+	if(g_skippedCount < (int)(sizeof(g_skipped) / sizeof(g_skipped[0]))) g_skipped[g_skippedCount++] = b;
+}
 
 // ---------------- Tolk ----------------
 typedef void (__cdecl *TolkLoadFn)(void);
@@ -265,6 +281,43 @@ static bool NvdaReady(void)
 	return false;
 }
 
+// ---------------- 争渡读屏（ZDSR）----------------
+// 官方 ZDSRAPI.dll（32 位那份就叫 ZDSRAPI.dll；_x64 那份不是我们要的）。
+// 全部 __stdcall —— 与上面 NVDA 一组，**不要**抄 Tolk 那组 __cdecl。
+// 加载/可用性/朗读的实现都在 src\zdsr_api.h（同一份代码被 tools\zdsr_selftest 复用）。
+//
+// 两条必须守住的规矩（理由见 zdsr_api.h 文件头）：
+//   · 可用性只看 GetSpeakState() ∈ {3,4}，**不看** Speak() 的返回值
+//     （未授权时 Speak 照样返回 0 —— 那正是「自称成功却一声不响」的来源）；
+//   · 争渡没装/没运行/没授权时只是判不可用 → 继续往下试 SAPI，绝不抛异常、绝不中止。
+static ZdsrApi g_zdsr;
+
+// 宽字符原因 → UTF-8 的 why（诊断日志与 g_verdict 都是 UTF-8 字节串）
+static void WhyToUtf8(const wchar_t *w, char *why, size_t cap)
+{
+	if(cap == 0) return;
+	why[0] = 0;
+	if(!w || !w[0]) return;
+	WideCharToMultiByte(CP_UTF8, 0, w, -1, why, (int)cap, NULL, NULL);
+	why[cap - 1] = 0;
+}
+
+static bool TryZdsr(char *why, size_t cap)
+{
+	// 每次都重新找、重新握手：争渡可能后装、后启动、后授权。**不缓存「找不到」**。
+	if(!ZdsrOpen(g_exeDir, &g_zdsr))
+	{
+		WhyToUtf8(g_zdsr.why, why, cap);
+		if(!why[0]) _snprintf_s(why, cap, _TRUNCATE, "争渡不可用");
+		diag("ZDSR: 不可用："); diag(why); diag("\n");
+		return false;
+	}
+	_snprintf_s(g_backendName, sizeof(g_backendName), _TRUNCATE, "争渡读屏 (ZDSR)");
+	diag("ZDSR: 可用 dll="); diagW(g_zdsr.path);
+	diagf("ZDSR: InitTTS=%d GetSpeakState=%d\n", g_zdsr.initRc, g_zdsr.state);
+	return true;
+}
+
 // ---------------- SAPI ----------------
 // vtable 槽位见 A11yFramework/Sapi.cs（ISpVoice : ISpEventSource : ISpNotifySource : IUnknown）
 static const GUID CLSID_SpVoice =
@@ -324,14 +377,44 @@ static bool TrySapi(char *why, size_t cap)
 
 // ---------------- 对外接口 ----------------
 
-static const char *BackendTag(void)
+// 后端的 ASCII 名字（只进诊断日志；给人看的名字走 Ph() 的文案表）
+static const char *BackendNameOf(Backend b)
 {
-	switch(g_backend)
+	switch(b)
 	{
 	case BK_TOLK: return "Tolk";
 	case BK_NVDA: return "NVDA";
+	case BK_ZDSR: return "ZDSR";
 	case BK_SAPI: return "SAPI";
 	default:      return "无";
+	}
+}
+
+static const char *BackendTag(void) { return BackendNameOf(g_backend); }
+
+// 试一个**指定**的后端：成功返回 true，并且 g_backendName 已经写好
+// （Tolk 例外：它自己写 g_backendName，因为有「Tolk (SAPI 兜底)」这种情形）。
+// 自动链、以及 F9 切换时的可用性探测，走的都是这一个函数 —— 只有一份实现。
+static bool TryBackend(Backend b, char *why, size_t cap)
+{
+	switch(b)
+	{
+	case BK_TOLK:
+		return TryTolk(why, cap);
+	case BK_NVDA:
+		if(!NvdaLoadDll(why, cap)) return false;
+		if(!NvdaReady()) { if(!why[0]) _snprintf_s(why, cap, _TRUNCATE, "NVDA 未运行"); return false; }
+		_snprintf_s(g_backendName, sizeof(g_backendName), _TRUNCATE, "NVDA");
+		return true;
+	case BK_ZDSR:
+		return TryZdsr(why, cap);
+	case BK_SAPI:
+		if(!TrySapi(why, cap)) return false;
+		_snprintf_s(g_backendName, sizeof(g_backendName), _TRUNCATE, "SAPI");
+		return true;
+	default:
+		_snprintf_s(why, cap, _TRUNCATE, "未知后端");
+		return false;
 	}
 }
 
@@ -339,21 +422,50 @@ static bool SpeechInit(void)
 {
 	char why[256];
 	g_verdict[0] = 0;
+	g_skippedCount = 0;
+
+	// 0. 用户选定的后端优先（F9 切换的结果，或 a11y_speech.ini 里定死的）。
+	//    BK_NONE = 自动，直接走下面的完整降级链。
+	//    指定的后端现在不可用 → 记进「跳过」清单，如实降级回自动链，绝不假装成功。
+	if(g_forceBackend != BK_NONE)
+	{
+		why[0] = 0;
+		if(TryBackend(g_forceBackend, why, sizeof(why)))
+		{
+			g_backend = g_forceBackend;
+			return true;
+		}
+		diag("指定的语音后端不可用："); diag(why); diag("\n");
+		NoteSkipped(g_forceBackend);
+		_snprintf_s(g_verdict + strlen(g_verdict), sizeof(g_verdict) - strlen(g_verdict), _TRUNCATE,
+			"指定 %s：%s；→ 回退自动链；", BackendNameOf(g_forceBackend), why);
+	}
 
 	// 1. Tolk
 	why[0] = 0;
-	if(TryTolk(why, sizeof(why))) { g_backend = BK_TOLK; return true; }
+	if(TryBackend(BK_TOLK, why, sizeof(why))) { g_backend = BK_TOLK; return true; }
+	NoteSkipped(BK_TOLK);
 	_snprintf_s(g_verdict + strlen(g_verdict), sizeof(g_verdict) - strlen(g_verdict), _TRUNCATE, "Tolk：%s；", why);
 
 	// 2. NVDA
 	why[0] = 0;
-	if(NvdaLoadDll(why, sizeof(why)) && NvdaReady()) { g_backend = BK_NVDA; _snprintf_s(g_backendName, sizeof(g_backendName), _TRUNCATE, "NVDA"); return true; }
+	if(TryBackend(BK_NVDA, why, sizeof(why))) { g_backend = BK_NVDA; return true; }
+	NoteSkipped(BK_NVDA);
 	if(!why[0]) _snprintf_s(why, sizeof(why), _TRUNCATE, "NVDA 未运行");
 	_snprintf_s(g_verdict + strlen(g_verdict), sizeof(g_verdict) - strlen(g_verdict), _TRUNCATE, "NVDA：%s；", why);
 
-	// 3. SAPI
+	// 3. 争渡读屏（ZDSR）—— 排在 NVDA 之后、SAPI 之前：
+	//    已经用 Tolk/NVDA 的机器行为完全不变，只装争渡的机器才落到这一级
+	//    （只装争渡的机器过去在 Tolk→NVDA→SAPI 这条链上大概率一片安静）。
 	why[0] = 0;
-	if(TrySapi(why, sizeof(why))) { g_backend = BK_SAPI; _snprintf_s(g_backendName, sizeof(g_backendName), _TRUNCATE, "SAPI"); return true; }
+	if(TryBackend(BK_ZDSR, why, sizeof(why))) { g_backend = BK_ZDSR; return true; }
+	NoteSkipped(BK_ZDSR);
+	_snprintf_s(g_verdict + strlen(g_verdict), sizeof(g_verdict) - strlen(g_verdict), _TRUNCATE, "ZDSR：%s；", why);
+
+	// 4. SAPI
+	why[0] = 0;
+	if(TryBackend(BK_SAPI, why, sizeof(why))) { g_backend = BK_SAPI; return true; }
+	NoteSkipped(BK_SAPI);
 	_snprintf_s(g_verdict + strlen(g_verdict), sizeof(g_verdict) - strlen(g_verdict), _TRUNCATE, "SAPI：%s；", why);
 
 	g_backend = BK_NONE;
@@ -387,6 +499,22 @@ static void SpeechSpeak(const wchar_t *text, bool interrupt)
 		int rc = g_nvdaSpeak(text);
 		if(rc != 0) { g_nvdaOk = false; g_nvdaNextProbe = 0; }
 	}
+	else if(g_backend == BK_ZDSR)
+	{
+		// interrupt 原样透传（官方：TRUE=清空排队立刻打断、FALSE=等空闲）。
+		// 还没实测过「争渡的打断够不够干净」—— 若将来发现它排得太长，再补一次
+		// ZdsrSilence()。返回非 0（状态不对、或 Speak 返回 2/8/9）就放弃这一级：
+		// 让下一次朗读立刻重挑后端（g_nextRetry=0），而不是继续「假装在念」。
+		int rc = ZdsrSay(&g_zdsr, text, interrupt ? TRUE : FALSE);
+		if(rc != ZDSR_RC_OK)
+		{
+			char z8[320];
+			WhyToUtf8(g_zdsr.why, z8, sizeof(z8));
+			diag("ZDSR 朗读失败："); diag(z8[0] ? z8 : "(无原因)"); diag("\n");
+			g_backend = BK_NONE;
+			g_nextRetry = 0;
+		}
+	}
 	else if(g_backend == BK_SAPI)
 	{
 		if(g_spSpeak)
@@ -401,6 +529,7 @@ static void SpeechStop(void)
 {
 	if(g_backend == BK_TOLK && g_tolkSilence) g_tolkSilence();
 	else if(g_backend == BK_NVDA && g_nvdaCancel) g_nvdaCancel();
+	else if(g_backend == BK_ZDSR) ZdsrSilence(&g_zdsr);
 	else if(g_backend == BK_SAPI && g_spSpeak) g_spSpeak(g_spVoice, NULL, SPF_ASYNC | SPF_PURGEBEFORESPEAK, NULL);
 }
 
@@ -618,6 +747,8 @@ enum {
 	P_SKIP_START, P_SKIP_END, P_SKIP_STUCK, P_SKIP_NOTADV, P_SKIP_NONAV, P_SKIP_NOTEXT,
 	P_SLIDER_NO, P_SLIDER_PCT, P_NO_WINDOW, P_NOTICE, P_NOTHING_READ, P_LOADED,
 	P_KEY1, P_KEY2, P_GESTURE,
+	P_BACKEND, P_BACKEND_AUTO, P_BACKEND_SKIP,
+	P_BK_AUTO, P_BK_TOLK, P_BK_NVDA, P_BK_ZDSR, P_BK_SAPI,
 	P_COUNT
 };
 
@@ -625,7 +756,7 @@ struct UiPhrase { const wchar_t *jp, *en, *cn, *tw; };
 // 这张表**必须与上面的 enum 一一对应**（靠位置取值，没有键）。
 // 曾经把 P_PAGE 加进 enum 中间、表行却加在 P_SLOT 后面 → 后面每条文案整体移一位，
 // 界面上直接念出了「第 %d 页」。加新条目时两处一起改，且保持同一个顺序。
-static const UiPhrase g_phrases[P_COUNT] = {
+static const UiPhrase g_phrases[] = {
 	/* P_NAV_ENTER     */ { L"ナビゲーションモード。", L"Navigation mode.", L"导航模式。", L"導航模式。" },
 	/* P_NAV_EXIT      */ { L"ナビゲーションモードを終了しました。", L"Navigation mode off.", L"已退出导航模式。", L"已結束導航模式。" },
 	/* P_NAV_ON        */ { L"ナビゲーションモード、%d 項目、", L"Navigation mode, %d items, ", L"导航模式，共 %d 项，", L"導航模式，共 %d 項，" },
@@ -663,7 +794,20 @@ static const UiPhrase g_phrases[P_COUNT] = {
 	/* P_KEY1          */ { L"主キー", L"primary key", L"主键", L"主鍵" },
 	/* P_KEY2          */ { L"副キー", L"secondary key", L"副键", L"副鍵" },
 	/* P_GESTURE       */ { L"（ジェスチャー機能）", L" (gesture)", L"（手势功能）", L"（手勢功能）" },
+	/* P_BACKEND       */ { L"音声バックエンド：%s", L"Speech backend: %s", L"语音后端：%s", L"語音後端：%s" },
+	/* P_BACKEND_AUTO  */ { L"音声バックエンド：自動（現在 %s）", L"Speech backend: automatic (currently %s)", L"语音后端：自动（当前 %s）", L"語音後端：自動（目前 %s）" },
+	/* P_BACKEND_SKIP  */ { L"。利用できないため省略：%s", L". Skipped as unavailable: %s", L"。已跳过不可用的：%s", L"。已略過無法使用的：%s" },
+	/* P_BK_AUTO       */ { L"自動", L"automatic", L"自动", L"自動" },
+	/* P_BK_TOLK       */ { L"Tolk", L"Tolk", L"Tolk", L"Tolk" },
+	/* P_BK_NVDA       */ { L"NVDA", L"NVDA", L"NVDA", L"NVDA" },
+	// 争渡读屏是中文产品名：日文/英文这两列用通用缩写 ZDSR，不硬造译名
+	/* P_BK_ZDSR       */ { L"ZDSR", L"ZDSR", L"争渡读屏", L"爭渡讀屏" },
+	/* P_BK_SAPI       */ { L"SAPI", L"SAPI", L"SAPI", L"SAPI" },
 };
+// 表行数与 enum 必须一致：这里的 static_assert 就是防「加进 enum 却忘了加表行」——
+// 那种错会让后面每条文案整体移一位，界面上直接念出别的句子（历史上踩过一次）。
+static_assert(sizeof(g_phrases) / sizeof(g_phrases[0]) == P_COUNT,
+	"g_phrases 的行数必须与 P_* enum 一一对应（靠位置取值，没有键）");
 
 static const wchar_t *Ph(int id)
 {
@@ -2312,6 +2456,376 @@ static void SelectChoice(int i)
 	g_rescanAt = GetTickCount() + 600;
 }
 
+// ================================================ L1.5 语音后端选择与快捷键 ====
+//
+// 这个仓库原本**没有任何配置项**（后端顺序写死在 SpeechInit 里）。这里新开一个
+// **独立**的小配置文件，刻意不去动 a11y_labels*.ini —— 那张表的定位是「控件标签
+// 改口供」（见 data\a11y_labels.ini 开头），把后端选择塞进去会污染那个定位。
+//
+//   plugin\a11y_speech.ini   （找不到就看 exe 同目录那份；两份都没有就用默认值）
+//
+//       # 注释用 # 或 ; 开头，UTF-8（有没有 BOM 都认）
+//       key=F9              切换快捷键；支持 Ctrl/Alt/Shift/Win 修饰键写法
+//       backend=auto        上次选定：auto / tolk / nvda / zdsr / sapi
+//                           （也认「自动」「争渡」这两种中文写法）
+//
+// 用快捷键切过之后，插件会把 backend= 那一行改写掉（其余行原样保留，包括用户自己
+// 写的注释和 key=），于是下次启动还是同一个后端。写不进去（目录只读等）不影响本次
+// 使用，只在诊断日志里留一句。
+//
+// 按键检测放在既有的 200 ms 定时器里读键状态，而不是子类化吞键，理由：
+//   · 插件自己的窗口是 message-only 的，**根本拿不到键盘焦点**；
+//   · 本作也不把键盘交给窗口消息（见前面「本作完全不收键盘」的实测），
+//     所以「只有游戏窗口收到 WM_KEYDOWN 才算数」那条路覆盖不全；
+//   · GetAsyncKeyState 与焦点无关，代价只是「按下的那一刻游戏窗口要在前台」——
+//     这一条由 HotkeyContextOk() 自己判。
+// 我们**只读键、不吞键**：游戏自己若也响应这个键，会照旧响应。宁可重复触发，也不抢键。
+
+static wchar_t g_cfgPath[MAX_PATH];    // 读到的（或将要创建的）a11y_speech.ini
+static UINT    g_hotkeyVk = VK_F9;     // 默认 F9
+static bool    g_hkCtrl = false, g_hkAlt = false, g_hkShift = false, g_hkWin = false;
+static bool    g_hkDown = false;       // 边沿检测：一次按下只动作一次
+
+// 键名 → 虚拟键码。只支持 F1..F24、A..Z、0..9：够用，而且不会误吞常用编辑键。
+static UINT KeyNameToVk(const wchar_t *t)
+{
+	if(!t || !t[0]) return 0;
+	if(t[0] == L'F' || t[0] == L'f')
+	{
+		const wchar_t *d = t + 1;
+		while(*d >= L'0' && *d <= L'9') d++;
+		if(d != t + 1 && *d == 0)
+		{
+			int n = _wtoi(t + 1);
+			if(n >= 1 && n <= 24) return (UINT)(VK_F1 + n - 1);
+		}
+		return 0;
+	}
+	if(t[1] != 0) return 0;
+	wchar_t c = t[0];
+	if(c >= L'a' && c <= L'z') c = (wchar_t)(c - L'a' + L'A');
+	if((c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9')) return (UINT)c;
+	return 0;
+}
+
+// "Alt+Shift+F9" → 修饰键 + 主键；解析不了返回 false（调用方保留默认 F9 并记日志）
+static bool ParseHotkeySpec(const wchar_t *spec, UINT *vk, bool *c, bool *a, bool *s, bool *w)
+{
+	wchar_t buf[128];
+	wcsncpy_s(buf, 128, spec ? spec : L"", _TRUNCATE);
+	UINT key = 0;
+	bool mc = false, ma = false, ms = false, mw = false;
+	wchar_t *ctx = NULL;
+	for(wchar_t *tok = wcstok_s(buf, L"+", &ctx); tok; tok = wcstok_s(NULL, L"+", &ctx))
+	{
+		while(*tok == L' ' || *tok == L'\t') tok++;
+		size_t n = wcslen(tok);
+		while(n > 0 && (tok[n-1] == L' ' || tok[n-1] == L'\t')) tok[--n] = 0;
+		if(!n) continue;
+		if(!_wcsicmp(tok, L"ctrl") || !_wcsicmp(tok, L"control"))      mc = true;
+		else if(!_wcsicmp(tok, L"alt"))                                ma = true;
+		else if(!_wcsicmp(tok, L"shift"))                              ms = true;
+		else if(!_wcsicmp(tok, L"win") || !_wcsicmp(tok, L"windows"))  mw = true;
+		else
+		{
+			UINT k = KeyNameToVk(tok);
+			if(!k || key) return false;   // 主键只能有一个；认不出的键名直接判非法
+			key = k;
+		}
+	}
+	if(!key) return false;
+	*vk = key; *c = mc; *a = ma; *s = ms; *w = mw;
+	return true;
+}
+
+// backend= 的值。大小写不敏感；另外认两个中文写法（这个文件的读者是中文用户）
+static bool ParseBackendValue(const wchar_t *v, Backend *out)
+{
+	if(!_wcsicmp(v, L"auto") || !wcscmp(v, L"自动") || !wcscmp(v, L"自動")) { *out = BK_NONE; return true; }
+	if(!_wcsicmp(v, L"tolk")) { *out = BK_TOLK; return true; }
+	if(!_wcsicmp(v, L"nvda")) { *out = BK_NVDA; return true; }
+	if(!_wcsicmp(v, L"zdsr") || !wcscmp(v, L"争渡") || !wcscmp(v, L"争渡读屏") || !wcscmp(v, L"爭渡讀屏"))
+		{ *out = BK_ZDSR; return true; }
+	if(!_wcsicmp(v, L"sapi")) { *out = BK_SAPI; return true; }
+	return false;
+}
+
+// 写回文件时用的 ASCII 记号（中文值读得进、但写回统一用 ASCII，方便手改与比对）
+static const char *ForceToken(Backend b)
+{
+	switch(b)
+	{
+	case BK_TOLK: return "tolk";
+	case BK_NVDA: return "nvda";
+	case BK_ZDSR: return "zdsr";
+	case BK_SAPI: return "sapi";
+	default:      return "auto";
+	}
+}
+
+static void LoadSpeechConfig(void)
+{
+	static const wchar_t *rels[2] = { L"plugin\\a11y_speech.ini", L"a11y_speech.ini" };
+	FILE *f = NULL;
+	for(int i = 0; i < 2; i++)
+	{
+		_snwprintf_s(g_cfgPath, MAX_PATH, _TRUNCATE, L"%s%s", g_exeDir, rels[i]);
+		_wfopen_s(&f, g_cfgPath, L"rb");
+		if(f) break;
+	}
+	if(!f)
+	{
+		// 两份都没有：用默认值；写入路径定为 plugin\（下次切完就落在这里）
+		_snwprintf_s(g_cfgPath, MAX_PATH, _TRUNCATE, L"%s%s", g_exeDir, rels[0]);
+		diag("a11y_speech.ini: 未找到，用默认值（key=F9、自动后端）\n");
+		return;
+	}
+
+	char buf[512];
+	int lines = 0;
+	while(fgets(buf, sizeof(buf), f))
+	{
+		lines++;
+		char *s = buf;
+		if((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) s += 3;
+		while(*s == ' ' || *s == '\t') s++;
+		if(*s == '#' || *s == ';' || *s == '\r' || *s == '\n' || *s == 0) continue;
+		char *eq = strchr(s, '=');
+		if(!eq) continue;
+		*eq = 0;
+		char *nm = s; char *vl = eq + 1;
+		size_t nl = strlen(nm);
+		while(nl > 0 && (nm[nl-1] == ' ' || nm[nl-1] == '\t')) nm[--nl] = 0;
+		while(*vl == ' ' || *vl == '\t') vl++;
+		size_t vlen = strlen(vl);
+		while(vlen > 0 && (vl[vlen-1] == '\r' || vl[vlen-1] == '\n' || vl[vlen-1] == ' ')) vl[--vlen] = 0;
+		if(nl == 0 || vlen == 0) continue;
+
+		wchar_t wv[128];
+		utf8ToW(vl, wv, 128);
+		if(_stricmp(nm, "key") == 0)
+		{
+			UINT vk; bool c, a, s2, w;
+			if(ParseHotkeySpec(wv, &vk, &c, &a, &s2, &w))
+			{
+				g_hotkeyVk = vk; g_hkCtrl = c; g_hkAlt = a; g_hkShift = s2; g_hkWin = w;
+				diag("a11y_speech.ini: key="); diagW(wv);
+			}
+			else
+			{
+				diag("a11y_speech.ini: key= 解析不了，保留默认 F9："); diagW(wv);
+			}
+		}
+		else if(_stricmp(nm, "backend") == 0)
+		{
+			Backend b;
+			if(ParseBackendValue(wv, &b))
+			{
+				g_forceBackend = b;
+				diag("a11y_speech.ini: backend="); diagW(wv);
+			}
+			else
+			{
+				diag("a11y_speech.ini: backend= 认不出来，按自动处理："); diagW(wv);
+			}
+		}
+	}
+	fclose(f);
+	diagf("a11y_speech.ini: %d 行，key VK=0x%02X mods=%d%d%d%d，选定后端=%s\n",
+		lines, (unsigned)g_hotkeyVk, g_hkCtrl ? 1 : 0, g_hkAlt ? 1 : 0,
+		g_hkShift ? 1 : 0, g_hkWin ? 1 : 0, ForceToken(g_forceBackend));
+}
+
+// 把当前选择写回 a11y_speech.ini 的 backend= 行：其余行原样保留（用户的注释、
+// 用户自己定的 key= 都不动）。文件不存在时连注释头一起建一份。
+static void SaveForceBackend(void)
+{
+	if(!g_cfgPath[0]) return;
+
+	char lines[40][256];
+	int n = 0;
+	FILE *f = NULL;
+	_wfopen_s(&f, g_cfgPath, L"rb");
+	if(f) { while(n < 40 && fgets(lines[n], 256, f)) n++; fclose(f); }
+
+	char want[64];
+	_snprintf_s(want, sizeof(want), _TRUNCATE, "backend=%s\n", ForceToken(g_forceBackend));
+
+	FILE *o = NULL;
+	_wfopen_s(&o, g_cfgPath, L"wb");
+	if(!o) { diag("a11y_speech.ini: 写不进去（目录只读？）——本次选择有效，但下次启动会丢\n"); return; }
+
+	if(n == 0)
+	{
+		fputs("# a11y_speech.ini —— 语音后端与切换快捷键（UTF-8，插件会自动更新 backend= 一行）\n"
+		      "# key     ：切换快捷键，默认 F9；可用 Ctrl+/Alt+/Shift+/Win+ 组合，主键限 F1..F24、A..Z、0..9\n"
+		      "# backend ：auto（自动，默认）/ tolk / nvda / zdsr / sapi\n"
+		      "# 删掉本文件即恢复默认；改 key= 之后重开游戏生效。\n", o);
+	}
+	bool wrote = false;
+	for(int i = 0; i < n; i++)
+	{
+		char *s = lines[i];
+		while(*s == ' ' || *s == '\t') s++;
+		if(!wrote && _strnicmp(s, "backend", 7) == 0)
+		{
+			char *p = s + 7;
+			while(*p == ' ' || *p == '\t') p++;
+			if(*p == '=') { fputs(want, o); wrote = true; continue; }
+		}
+		fputs(lines[i], o);
+	}
+	if(!wrote) fputs(want, o);
+	fclose(o);
+	diag("a11y_speech.ini: backend="); diag(ForceToken(g_forceBackend)); diag("\n");
+}
+
+// ---------------- F9：循环切换 ----------------
+// 顺序（需求指定）：自动 → Tolk → NVDA → 争渡 → SAPI → 回到自动。
+// 不在这个顺序里、或当前不可用的后端一律跳过，并在播报里说明跳过了谁。
+static const Backend CYCLE_ORDER[5] = { BK_NONE, BK_TOLK, BK_NVDA, BK_ZDSR, BK_SAPI };
+#define CYCLE_N ((int)(sizeof(CYCLE_ORDER) / sizeof(CYCLE_ORDER[0])))
+
+// 后端在播报里的名字（插件自己要说的话，跟界面语言走；见 g_phrases 的纪律）
+static const wchar_t *BackendDisplayName(Backend b)
+{
+	switch(b)
+	{
+	case BK_TOLK: return Ph(P_BK_TOLK);
+	case BK_NVDA: return Ph(P_BK_NVDA);
+	case BK_ZDSR: return Ph(P_BK_ZDSR);
+	case BK_SAPI: return Ph(P_BK_SAPI);
+	default:      return Ph(P_BK_AUTO);
+	}
+}
+
+static const wchar_t *ListSep(void) { return (g_lang == LANG_EN) ? L", " : L"、"; }
+
+static bool InList(const Backend *list, int n, Backend b)
+{
+	for(int i = 0; i < n; i++) if(list[i] == b) return true;
+	return false;
+}
+
+// 用**新后端**把结果念出来，并说清楚跳过了哪些（两批来源：本轮探测跳过的、
+// 以及刚刚 SpeechInit 里被跳过的）。
+static void AnnounceBackendChange(const Backend *skipA, int nA, const Backend *skipB, int nB)
+{
+	wchar_t sk[320], say[512];
+	sk[0] = 0;
+	int skCount = 0;
+	for(int i = 1; i < CYCLE_N; i++)   // 从 1 开始：不含「自动」
+	{
+		Backend b = CYCLE_ORDER[i];
+		if(!InList(skipA, nA, b) && !InList(skipB, nB, b)) continue;
+		if(skCount++) wcsncat_s(sk, 320, ListSep(), _TRUNCATE);
+		wcsncat_s(sk, 320, BackendDisplayName(b), _TRUNCATE);
+	}
+
+	if(g_forceBackend == BK_NONE)
+		_snwprintf_s(say, 512, _TRUNCATE, Ph(P_BACKEND_AUTO), BackendDisplayName(g_backend));
+	else
+		_snwprintf_s(say, 512, _TRUNCATE, Ph(P_BACKEND), BackendDisplayName(g_backend));
+
+	if(sk[0])
+	{
+		wchar_t suf[400];
+		_snwprintf_s(suf, 400, _TRUNCATE, Ph(P_BACKEND_SKIP), sk);
+		wcsncat_s(say, 512, suf, _TRUNCATE);
+	}
+	diag("后端切换播报: "); diagW(say);
+	SpeechSpeak(say, true);
+}
+
+static void CycleSpeechBackend(void)
+{
+	char why[256];
+	Backend probed[8];
+	int probedCount = 0;
+
+	// 先把当前后端停住：否则旧读屏还在念上一句、新读屏又开口，两把声音叠在一起。
+	SpeechStop();
+
+	int start = 0;
+	for(int i = 0; i < CYCLE_N; i++) if(CYCLE_ORDER[i] == g_forceBackend) { start = i; break; }
+
+	for(int step = 1; step <= CYCLE_N; step++)
+	{
+		Backend cand = CYCLE_ORDER[(start + step) % CYCLE_N];
+
+		if(cand == BK_NONE)   // 自动：走完整降级链
+		{
+			g_forceBackend = BK_NONE;
+			if(SpeechInit())
+			{
+				diagf("后端切换 → 自动，实际用 %s\n", g_backendName);
+				SaveForceBackend();
+				AnnounceBackendChange(probed, probedCount, g_skipped, g_skippedCount);
+			}
+			else
+			{
+				diagf("后端切换：自动链也没挑出后端，逐个结论: %s\n", g_verdict);
+			}
+			return;
+		}
+
+		why[0] = 0;
+		if(!TryBackend(cand, why, sizeof(why)))
+		{
+			if(probedCount < 8) probed[probedCount++] = cand;
+			diag("后端切换：跳过 "); diag(BackendNameOf(cand)); diag("（"); diag(why); diag("）\n");
+			continue;
+		}
+		// 探测已经成功：直接生效（TryBackend 成功时 g_backendName 已经写好）
+		g_forceBackend = cand;
+		g_backend = cand;
+		g_verdict[0] = 0;
+		g_nextRetry = 0;
+		diagf("后端切换 → %s（指定）\n", g_backendName);
+		SaveForceBackend();
+		AnnounceBackendChange(probed, probedCount, NULL, 0);
+		return;
+	}
+	diagf("后端切换：%d 个候选都不可用，逐个结论: %s\n", CYCLE_N, g_verdict);
+}
+
+// 「这一下该不该管」—— 按本插件既有的输入约定：
+//   · 还没找到游戏窗口 → 不管（NavEnter 也是这个判据：找不到窗口只念一句提示）
+//   · 前台不是本进程的窗口 → 不管（玩家可能在别的程序里按 F9 干别的事，
+//     那时候插一句播报只会更吵）
+//   · 正在快进 → 不管（快进是我们自己连点出来的状态，插一脚会打乱它「松手播报」的节奏）
+static bool HotkeyContextOk(void)
+{
+	if(!g_gameWnd) return false;
+	HWND fg = GetForegroundWindow();
+	DWORD pid = 0;
+	if(fg) GetWindowThreadProcessId(fg, &pid);
+	if(pid != GetCurrentProcessId()) return false;
+	if(g_skip) return false;
+	return true;
+}
+
+// 每拍查一次键状态（200 ms；快进时是 100 ms，但快进期间不动作）。不吞键。
+static void HotkeyTick(void)
+{
+	if(!g_hotkeyVk) return;
+	bool down = (GetAsyncKeyState((int)g_hotkeyVk) & 0x8000) != 0;
+	if(!down) { g_hkDown = false; return; }
+	if(g_hkDown) return;   // 只在「新的一次按下」上动作，长按不连切
+	g_hkDown = true;
+
+	// 修饰键必须**完全一致**：默认 F9 时按 Alt+F9 不触发；想避开冲突键就写
+	// key=Alt+Shift+F9，那时只有带这两个修饰键的 F9 才算数。
+	bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+	bool alt   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+	bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+	bool win   = ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
+	if(ctrl != g_hkCtrl || alt != g_hkAlt || shift != g_hkShift || win != g_hkWin) return;
+
+	if(!HotkeyContextOk()) return;
+	CycleSpeechBackend();
+}
+
 // 返回 true = 这一下按键由我们处理（游戏看不到它）
 static bool NavKeyDown(WPARAM vk, bool repeat)
 {
@@ -2522,7 +3036,7 @@ static LRESULT CALLBACK A11yWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 	switch(msg)
 	{
 	case WM_TIMER:
-		if(wp == TIMER_POLL) { PollDialogue(); NavTick(); return 0; }
+		if(wp == TIMER_POLL) { HotkeyTick(); PollDialogue(); NavTick(); return 0; }
 		break;
 	case WM_DESTROY:
 		KillTimer(hWnd, TIMER_POLL);
@@ -2563,7 +3077,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 		if(s) s[1] = 0;
 	}
 	diag("exeDir="); diagW(g_exeDir);
-	diag("== a11y6 build: CtrlFastForward + selectShowing + digit-choice ==\n");
+	diag("== a11y6 build: CtrlFastForward + selectShowing + digit-choice + ZDSR + F9 speech-backend switch ==\n");
 	LoadUserLabels();
 	BuildGeneratedAliases();
 
@@ -2588,6 +3102,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 	DetectLanguage();   // 函数指针就绪后才能问游戏的语言标签
 	LoadUserLabels();   // 语言标签已知，重新加载一次 a11y_labels_<tag>.ini
 	BuildGeneratedAliases();
+	LoadSpeechConfig();   // 语音后端与快捷键（plugin\a11y_speech.ini；没有就用默认值）
 	// 菜单栏的 caption 这时**还取不到**（KAG 的窗口菜单还没建），
 	// 由 EnsureMenuLabels() 在第一次扫描时懒加载。
 
