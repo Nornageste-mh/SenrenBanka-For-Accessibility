@@ -101,3 +101,12 @@ desktop.ini
 # ============================================================================
 !third_party/
 !third_party/**
+
+# ---- 发布组装 ----
+#   tools\_cache\        : 打包要用的外部二进制（注入工具 exe 等）—— 不进库
+#   build/release_stage\ : make_release.ps1 的组装目录 —— *.dll 规则已经挡住 dll，
+#                          这条是兜底，免得哪天加了不带扩展名的文件被顺手提交
+#   dist/                : 归档输出目录（*.7z 本来就在别的规则里，这里显式挡一层）
+build/release_stage/
+dist/
+tools/_cache/

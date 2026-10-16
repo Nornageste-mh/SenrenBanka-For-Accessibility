@@ -1,0 +1,15 @@
+; ============================================================================
+;  桩 DLL 的第二个变体（InitTTS 恒返回 1「版本不匹配」）的导出表。
+;
+;  导出名必须与官方 ZDSRAPI.dll **一模一样、不做名字修饰**（__stdcall 在 32 位上
+;  默认会被修饰成 _InitTTS@12）。名字一旦被修饰，插件那边 GetProcAddress("InitTTS")
+;  就会失败——那种「测了半天其实测的是缺导出」的错误正是本文件要防的。
+;  build_and_run.cmd 里会用 dumpbin /exports 复核一次修饰名。
+; ============================================================================
+LIBRARY zdsr_stub_mismatch
+EXPORTS
+	InitTTS
+	Speak
+	GetSpeakState
+	StopSpeak
+	Braille
