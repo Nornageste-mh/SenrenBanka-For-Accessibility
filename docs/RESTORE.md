@@ -11,7 +11,7 @@
    <游戏目录>\plugin\a11y.dll
    <游戏目录>\plugin\nvdaControllerClient.dll     ← NV Access 官方 x86 版（读屏桥）
    <游戏目录>\plugin\a11y_labels.ini              ← 可选；覆盖内置标签表，UTF-8
-   <游戏目录>\plugin\a11y_speech.ini              ← 可选；语音后端与 F9 键位，UTF-8
+   <游戏目录>\plugin\a11y_speech.ini              ← 可选；语音后端与 Alt+Shift+F9 键位，UTF-8
    ```
 
    争渡读屏（ZDSR）**不需要往这里放任何文件**：插件按官方建议直接读争渡安装目录下的
@@ -25,7 +25,7 @@
 
 想确认加载成功，看诊断日志：应当出现模块版本行、`a11y_labels.ini: N 条`、
 `语音后端: NVDA`（或 `争渡读屏 (ZDSR)` / `SAPI` / `Tolk`）、`game window subclassed hwnd=...`。
-按 `F9` 的切换结果也会记进去（`后端切换 → …`、`a11y_speech.ini: backend=…`）。
+按 `Alt+Shift+F9` 的切换结果也会记进去（`后端切换 → …`、`a11y_speech.ini: backend=…`）。
 
 ## 还原
 
