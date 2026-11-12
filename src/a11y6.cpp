@@ -15,11 +15,11 @@
 //   * 没有宿主进程、没有命名管道、没有伴随窗口里的标准控件。
 //     —— 文本**直接交给读屏 DLL**朗读（这就是三个仓库的做法）。
 //   * 游戏进程里只留一个 message-only 隐藏窗口（不可见、不可聚焦、不在任务栏），
-//     只用来跑 200 ms 定时器（抓文本 + 收开发用 REPL 命令）。
+//     只用来跑 200 ms 定时器（抓文本；A11Y_DEV 构建下另收开发用 REPL 命令）。
 //   * SAPI 兜底必须置 SPF_ASYNC：SAPI 默认同步朗读，会阻塞主线程 —— 那才是
 //     「游戏无响应」的真凶（A11yFramework/Sapi.cs 的注释里写着同一条事故）。
 //
-// 开发用通道（不进发布包）：D:\a11yb\sba11y_cmd.txt -> 执行 -> D:\a11yb\sba11y_res.txt
+// 开发用通道（仅 A11Y_DEV 构建，不进发布包）：D:\a11yb\sba11y_cmd.txt -> 执行 -> D:\a11yb\sba11y_res.txt
 #include <windows.h>
 #include <commctrl.h>   // SetWindowSubclass / DefSubclassProc（子类化游戏窗口用）
 #include <stdio.h>
@@ -120,6 +120,14 @@ enum { TIMER_POLL = 1 };
 #define POLL_MS      200   // 平时：抓文本 + 导航
 #define SKIP_POLL_MS 100   // 快进时收紧：选项一出现要尽量早停手
 
+// 诊断出口与开发用 REPL 通道由编译期开关 A11Y_DEV 统一控制：
+//   · 定义 A11Y_DEV（build\build.cmd dev）：与开发时完全一致 —— 诊断日志写
+//     D:\a11yb\a11y5_diag.txt，REPL 轮询 D:\a11yb\sba11y_cmd.txt；
+//   · 不定义（build\build.cmd 的默认发布构建）：诊断函数整体 no-op，REPL 整段
+//     不编译，发布 DLL 里不出现任何 D:\a11yb 路径（G40）。
+// 函数签名保持不变，避免 60 余处 diag()/diagf() 调用点逐个改动。
+#ifdef A11Y_DEV
+
 #define CMD_PATH  "D:\\a11yb\\sba11y_cmd.txt"
 #define RES_PATH  "D:\\a11yb\\sba11y_res.txt"
 #define DIAG_PATH "D:\\a11yb\\a11y5_diag.txt"
@@ -155,6 +163,15 @@ static void diagWN(const wchar_t *w, int len)
 }
 static void diagW(const wchar_t *w) { diagWN(w, -1); diag("\n"); }
 
+#else  // !A11Y_DEV —— 发布构建：诊断出口全部 no-op（签名保留，调用点不动）
+
+static void diag(const char *) {}
+static void diagf(const char *, ...) {}
+static void diagWN(const wchar_t *, int) {}
+static void diagW(const wchar_t *) {}
+
+#endif // A11Y_DEV
+
 // ================================================================ L1 Speech ===
 //
 // 后端链与 A11yFramework/platform/Speech.cs 一致：
@@ -170,12 +187,12 @@ static char    g_verdict[512] = "";
 static DWORD   g_nextRetry = 0;
 static const DWORD RETRY_MS = 10000;
 
-// 用户选定的后端（F9 循环切换的结果，也可写在 plugin\a11y_speech.ini 里）。
+// 用户选定的后端（热键循环切换的结果，也可写在 plugin\a11y_speech.ini 里）。
 // BK_NONE = 自动：不指定，走下面的完整降级链。选了指定后端但它现在不可用时
 // **如实降级回自动链**，绝不假装成功。
 static Backend g_forceBackend = BK_NONE;
 
-// 最近一次「挑后端」跳过了哪几个（供 F9 切换后的播报说清楚「跳过了什么」）。
+// 最近一次「挑后端」跳过了哪几个（供热键切换后的播报说清楚「跳过了什么」）。
 // SpeechInit 每次重挑开始时清空，每条后端失败时记一个。
 static Backend g_skipped[8];
 static int     g_skippedCount = 0;
@@ -203,9 +220,16 @@ static TolkUnloadFn    g_tolkUnload = NULL;
 
 static bool TryTolk(char *why, size_t cap)
 {
-	// 游戏目录（含 plugin\）→ 开发目录
-	static const char *cands[] = { "tolk.dll", "plugin\\tolk.dll", "D:\\a11yb\\tolk.dll" };
-	for(int i = 0; i < 3 && !g_tolkDll; i++) g_tolkDll = LoadLibraryA(cands[i]);
+	// 游戏目录（含 plugin\）→ 仅 A11Y_DEV 构建再追加开发目录
+	static const char *cands[] = {
+		"tolk.dll",
+		"plugin\\tolk.dll",
+#ifdef A11Y_DEV
+		"D:\\a11yb\\tolk.dll",
+#endif
+	};
+	for(int i = 0; i < (int)(sizeof(cands) / sizeof(cands[0])) && !g_tolkDll; i++)
+		g_tolkDll = LoadLibraryA(cands[i]);
 	if(!g_tolkDll)
 	{
 		// 再试 exe 同目录的绝对路径
@@ -258,7 +282,10 @@ static bool NvdaLoadDll(char *why, size_t cap)
 		_snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%s%s", g_exeDir, rel[i]);
 		g_nvdaDll = LoadLibraryW(p);
 	}
+#ifdef A11Y_DEV
+	// 开发机上的官方 controllerClient x86 副本（发布构建不编进去：G40 不留写死路径）
 	if(!g_nvdaDll) g_nvdaDll = LoadLibraryW(L"D:\\Harness工作区\\nvda_dl\\x86\\nvdaControllerClient.dll");
+#endif
 	if(!g_nvdaDll) { _snprintf_s(why, cap, _TRUNCATE, "找不到 nvdaControllerClient.dll"); return false; }
 
 	g_nvdaTest   = (NvdaTestFn)GetProcAddress(g_nvdaDll, "nvdaController_testIfRunning");
@@ -394,7 +421,7 @@ static const char *BackendTag(void) { return BackendNameOf(g_backend); }
 
 // 试一个**指定**的后端：成功返回 true，并且 g_backendName 已经写好
 // （Tolk 例外：它自己写 g_backendName，因为有「Tolk (SAPI 兜底)」这种情形）。
-// 自动链、以及 F9 切换时的可用性探测，走的都是这一个函数 —— 只有一份实现。
+// 自动链、以及热键切换时的可用性探测，走的都是这一个函数 —— 只有一份实现。
 static bool TryBackend(Backend b, char *why, size_t cap)
 {
 	switch(b)
@@ -424,7 +451,7 @@ static bool SpeechInit(void)
 	g_verdict[0] = 0;
 	g_skippedCount = 0;
 
-	// 0. 用户选定的后端优先（F9 切换的结果，或 a11y_speech.ini 里定死的）。
+	// 0. 用户选定的后端优先（热键切换的结果，或 a11y_speech.ini 里定死的）。
 	//    BK_NONE = 自动，直接走下面的完整降级链。
 	//    指定的后端现在不可用 → 记进「跳过」清单，如实降级回自动链，绝不假装成功。
 	if(g_forceBackend != BK_NONE)
@@ -988,7 +1015,8 @@ static void PollDialogue(void)
 {
 	if(InterlockedExchange(&g_pollBusy, 1) == 1) return;
 
-	// 开发用 REPL（发布时删掉这一段即可）
+#ifdef A11Y_DEV
+	// 开发用 REPL（发布构建整段不编译 —— 命令文件通道不进发布件）
 	FILE *cf = NULL; fopen_s(&cf, CMD_PATH, "rb");
 	if(cf)
 	{
@@ -1004,6 +1032,7 @@ static void PollDialogue(void)
 		if(rf) { fprintf(rf, "OK %s", res ? res : ""); fclose(rf); }
 		if(res) free(res);
 	}
+#endif // A11Y_DEV
 
 	static const char *kPoll =
 		"var __r = \"\";"
@@ -2465,7 +2494,8 @@ static void SelectChoice(int i)
 //   plugin\a11y_speech.ini   （找不到就看 exe 同目录那份；两份都没有就用默认值）
 //
 //       # 注释用 # 或 ; 开头，UTF-8（有没有 BOM 都认）
-//       key=F9              切换快捷键；支持 Ctrl/Alt/Shift/Win 修饰键写法
+//       key=Alt+Shift+F9    切换快捷键；支持 Ctrl/Alt/Shift/Win 修饰键写法
+//                           （默认 Alt+Shift+F9：裸 F9 常被读屏器占用）
 //       backend=auto        上次选定：auto / tolk / nvda / zdsr / sapi
 //                           （也认「自动」「争渡」这两种中文写法）
 //
@@ -2481,9 +2511,11 @@ static void SelectChoice(int i)
 //     这一条由 HotkeyContextOk() 自己判。
 // 我们**只读键、不吞键**：游戏自己若也响应这个键，会照旧响应。宁可重复触发，也不抢键。
 
+// 默认 Alt+Shift+F9：裸 F9 常被读屏器/其它无障碍工具占用，公约要求带修饰键。
+// key= 解析成功后会整组覆盖下面四个修饰键（见 LoadSpeechConfig）。
 static wchar_t g_cfgPath[MAX_PATH];    // 读到的（或将要创建的）a11y_speech.ini
-static UINT    g_hotkeyVk = VK_F9;     // 默认 F9
-static bool    g_hkCtrl = false, g_hkAlt = false, g_hkShift = false, g_hkWin = false;
+static UINT    g_hotkeyVk = VK_F9;     // 默认 Alt+Shift+F9
+static bool    g_hkCtrl = false, g_hkAlt = true, g_hkShift = true, g_hkWin = false;
 static bool    g_hkDown = false;       // 边沿检测：一次按下只动作一次
 
 // 键名 → 虚拟键码。只支持 F1..F24、A..Z、0..9：够用，而且不会误吞常用编辑键。
@@ -2508,7 +2540,7 @@ static UINT KeyNameToVk(const wchar_t *t)
 	return 0;
 }
 
-// "Alt+Shift+F9" → 修饰键 + 主键；解析不了返回 false（调用方保留默认 F9 并记日志）
+// "Alt+Shift+F9" → 修饰键 + 主键；解析不了返回 false（调用方保留默认 Alt+Shift+F9 并记日志）
 static bool ParseHotkeySpec(const wchar_t *spec, UINT *vk, bool *c, bool *a, bool *s, bool *w)
 {
 	wchar_t buf[128];
@@ -2577,7 +2609,7 @@ static void LoadSpeechConfig(void)
 	{
 		// 两份都没有：用默认值；写入路径定为 plugin\（下次切完就落在这里）
 		_snwprintf_s(g_cfgPath, MAX_PATH, _TRUNCATE, L"%s%s", g_exeDir, rels[0]);
-		diag("a11y_speech.ini: 未找到，用默认值（key=F9、自动后端）\n");
+		diag("a11y_speech.ini: 未找到，用默认值（key=Alt+Shift+F9、自动后端）\n");
 		return;
 	}
 
@@ -2613,7 +2645,7 @@ static void LoadSpeechConfig(void)
 			}
 			else
 			{
-				diag("a11y_speech.ini: key= 解析不了，保留默认 F9："); diagW(wv);
+				diag("a11y_speech.ini: key= 解析不了，保留默认 Alt+Shift+F9："); diagW(wv);
 			}
 		}
 		else if(_stricmp(nm, "backend") == 0)
@@ -2658,7 +2690,7 @@ static void SaveForceBackend(void)
 	if(n == 0)
 	{
 		fputs("# a11y_speech.ini —— 语音后端与切换快捷键（UTF-8，插件会自动更新 backend= 一行）\n"
-		      "# key     ：切换快捷键，默认 F9；可用 Ctrl+/Alt+/Shift+/Win+ 组合，主键限 F1..F24、A..Z、0..9\n"
+		      "# key     ：切换快捷键，默认 Alt+Shift+F9；可用 Ctrl+/Alt+/Shift+/Win+ 组合，主键限 F1..F24、A..Z、0..9\n"
 		      "# backend ：auto（自动，默认）/ tolk / nvda / zdsr / sapi\n"
 		      "# 删掉本文件即恢复默认；改 key= 之后重开游戏生效。\n", o);
 	}
@@ -2680,7 +2712,7 @@ static void SaveForceBackend(void)
 	diag("a11y_speech.ini: backend="); diag(ForceToken(g_forceBackend)); diag("\n");
 }
 
-// ---------------- F9：循环切换 ----------------
+// ---------------- 热键（默认 Alt+Shift+F9，可用 key= 覆盖）：循环切换 ----------------
 // 顺序（需求指定）：自动 → Tolk → NVDA → 争渡 → SAPI → 回到自动。
 // 不在这个顺序里、或当前不可用的后端一律跳过，并在播报里说明跳过了谁。
 static const Backend CYCLE_ORDER[5] = { BK_NONE, BK_TOLK, BK_NVDA, BK_ZDSR, BK_SAPI };
@@ -2791,7 +2823,7 @@ static void CycleSpeechBackend(void)
 
 // 「这一下该不该管」—— 按本插件既有的输入约定：
 //   · 还没找到游戏窗口 → 不管（NavEnter 也是这个判据：找不到窗口只念一句提示）
-//   · 前台不是本进程的窗口 → 不管（玩家可能在别的程序里按 F9 干别的事，
+//   · 前台不是本进程的窗口 → 不管（玩家可能在别的程序里按切换热键干别的事，
 //     那时候插一句播报只会更吵）
 //   · 正在快进 → 不管（快进是我们自己连点出来的状态，插一脚会打乱它「松手播报」的节奏）
 static bool HotkeyContextOk(void)
@@ -2814,8 +2846,8 @@ static void HotkeyTick(void)
 	if(g_hkDown) return;   // 只在「新的一次按下」上动作，长按不连切
 	g_hkDown = true;
 
-	// 修饰键必须**完全一致**：默认 F9 时按 Alt+F9 不触发；想避开冲突键就写
-	// key=Alt+Shift+F9，那时只有带这两个修饰键的 F9 才算数。
+	// 修饰键必须**完全一致**：默认 Alt+Shift+F9 时，裸 F9 或只带 Alt 的 F9 都不触发；
+	// 想换组合就写 key=（例如 key=Ctrl+F9），那时只有完全一致的修饰键才算数。
 	bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 	bool alt   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
 	bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -3067,7 +3099,9 @@ static void EnsurePump(void)
 extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 {
 	if(!g_hInst) g_hInst = GetModuleHandleW(NULL);
+#ifdef A11Y_DEV
 	DeleteFileA(DIAG_PATH);
+#endif
 	diag("=== V2Link (a11y5, 单进程) ===\n");
 
 	// exe 所在目录（含尾部反斜杠）
@@ -3077,7 +3111,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 		if(s) s[1] = 0;
 	}
 	diag("exeDir="); diagW(g_exeDir);
-	diag("== a11y6 build: CtrlFastForward + selectShowing + digit-choice + ZDSR + F9 speech-backend switch ==\n");
+	diag("== a11y6 build: CtrlFastForward + selectShowing + digit-choice + ZDSR + Alt+Shift+F9 speech-backend switch ==\n");
 	LoadUserLabels();
 	BuildGeneratedAliases();
 
