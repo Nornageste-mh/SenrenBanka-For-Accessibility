@@ -340,7 +340,7 @@ docs/无障碍补丁流水线.md   流水线（原文）
 docs/交互形态判定.md      本作判定：C 类 + 遗留形态 + 遗留缺陷清单
 docs/操作约定.md          本作键位、差异原因、原生占用键、不提供的语义
 docs/project_status.md    项目状态单入口（模块/证据/待验证/遗留/交接）
-docs/templates/           Framework 文档模板 6 份
+docs/templates/           Framework 文档模板 7 份
 无障碍可行性验证.md        本作 P0 可行性验证
 测试问卷.md               本作读屏验收问卷（P4 用）
 mod/package/             发布包内文档（安装说明.md、常见问题.md）
