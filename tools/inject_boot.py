@@ -2,7 +2,11 @@
 # -*- coding: utf-8 -*-
 """把本补丁的启动脚本注入《千恋＊万花》的 data.xp3 —— 自包含的单文件工具。
 
-    python inject_boot.py --data <游戏目录>\\data.xp3 --script ..\\data\\startup.tjs --out data.patched.xp3
+    python inject_boot.py --data <游戏目录>\\data.xp3 --out data.patched.xp3
+
+字节码默认读仓库里的 data/startup.tjs.bin（已入库、已实测可用），正常发布构建
+不需要 tjs2c.exe。--bin 可以指定别的字节码文件；--script + --tjs2c 只是旧流程
+兼容用法，仅当默认 .bin 不存在时才会用到。--bin 优先级最高。
 
 只有纯标准库依赖（zlib / struct / hashlib），不需要装任何东西。
 
@@ -27,6 +31,10 @@ import zlib
 BOOT_NAME = 'startup.tjs'
 BOOT_MAGIC = b'TJS2100'
 BOOT_XOR = 0x01          # 落盘混淆：TJS2100 <-> UKR3011
+
+# 仓库内置的字节码：tools/ 的上一级 data/ 下（干净克隆即可用）.
+DEFAULT_BIN = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'startup.tjs.bin'))
 
 
 # ---------------------------------------------------------------- 归档解析
@@ -97,8 +105,8 @@ def read_file(src, rec):
 def compile_tjs(script_path, tjs2c):
     """把 .tjs 编译成 TJS2100 字节码。返回 raw 字节。"""
     if not tjs2c:
-        raise SystemExit('需要 tjs2c.exe 来编译 .tjs —— 用 --tjs2c 指定，'
-                         '或者先用 --bin 传入已编译好的字节码')
+        raise SystemExit('需要 tjs2c.exe 来编译 .tjs —— 用 --tjs2c 指定；'
+                         '通常不需要编译，直接让脚本读 data/startup.tjs.bin 即可')
     tmp = tempfile.mkdtemp(prefix='a11yboot')
     raw = os.path.join(tmp, 'boot.raw')
     r = subprocess.run([tjs2c, script_path, raw], capture_output=True)
@@ -107,19 +115,43 @@ def compile_tjs(script_path, tjs2c):
     return open(raw, 'rb').read()
 
 
+def read_bin(path):
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except OSError as e:
+        raise SystemExit('读不了字节码文件 %s: %s' % (path, e))
+
+
+def load_boot(a):
+    """按优先级取字节码：--bin > 仓库内置 data/startup.tjs.bin > --script + --tjs2c."""
+    if a.bin:
+        print('字节码: %s（--bin）' % a.bin)
+        return read_bin(a.bin)
+    if os.path.exists(DEFAULT_BIN):
+        print('字节码: %s（仓库内置）' % os.path.normpath(DEFAULT_BIN))
+        return read_bin(DEFAULT_BIN)
+    if a.script:
+        return compile_tjs(a.script, a.tjs2c)
+    raise SystemExit('找不到内置字节码 %s；请用 --bin 指定，或同时给 --script 与 --tjs2c'
+                     % os.path.normpath(DEFAULT_BIN))
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main():
-    ap = argparse.ArgumentParser(description='把启动脚本注入 data.xp3')
+    ap = argparse.ArgumentParser(
+        description='把启动脚本字节码注入 data.xp3',
+        epilog='字节码来源优先级：--bin > 仓库内置 data/startup.tjs.bin > '
+               '--script + --tjs2c。默认用仓库内置 .bin，正常发布构建不需要 tjs2c。')
     ap.add_argument('--data', required=True, help='原始游戏 data.xp3')
     ap.add_argument('--out', required=True, help='输出的 data.xp3（不要覆盖原档）')
-    src_g = ap.add_mutually_exclusive_group(required=True)
-    src_g.add_argument('--script', help='本补丁的 startup.tjs')
-    src_g.add_argument('--bin', help='已编译好的 TJS2100 字节码（跳过编译）')
-    ap.add_argument('--tjs2c', help='tjs2c.exe 路径')
+    ap.add_argument('--bin', help='已编译好的 TJS2100 字节码文件（默认 ../data/startup.tjs.bin）')
+    ap.add_argument('--script', help='TJS 源码 startup.tjs（仅在默认 .bin 缺失时回退编译，需 --tjs2c）')
+    ap.add_argument('--tjs2c', help='tjs2c.exe 路径（仅源码回退编译时使用）')
     a = ap.parse_args()
 
-    boot = open(a.bin, 'rb').read() if a.bin else compile_tjs(a.script, a.tjs2c)
+    boot = load_boot(a)
     # 接受两种形态：明文 TJS2100，或已按 0x01 混淆过的 UKR3011。
     if boot[:7] == b'TJS2100':
         pass

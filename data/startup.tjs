@@ -1,0 +1,86 @@
+# data/startup.tjs —— 说明文件（不是 TJS 源码）
+
+> 注意：本文件是**说明文档**，不是可编译的 TJS 源码。
+> 引擎、tjs2c、安装器都**不要**直接使用本文件；真正要嵌入/注入的字节码是同目录的
+> [`data/startup.tjs.bin`](startup.tjs.bin)。文件名沿用 `startup.tjs` 只是历史原因
+> （旧构建脚本曾把 `data/startup.tjs` 当作源码路径），内容已改为文档。
+
+## 这是什么
+
+`data/startup.tjs.bin` 是 KiriKiri Z 启动脚本 `startup.tjs` 的**已编译 TJS2 字节码**
+（TJS2100 格式，明文，1404 字节）。安装器把它写进游戏 `data.xp3` 归档的
+`startup.tjs` 槽位，让引擎开机时执行
+
+    Plugins.link("a11y.dll");
+
+这一句，从而加载本仓库的无障碍补丁 DLL。字节码里可以直接看到
+`a11y.dll`、`Plugins`、`link` 字符串（TJS2 字节码的字符串是 UTF-16LE 存储的），
+其余是 krkrz 官方标准 `startup.tjs` 的内容（`kirikiriz`、`system/Initialize.tjs`、
+`inXP3archivePacked` 等）。它**不含**任何游戏剧情、图片、音频或其它游戏资源。
+
+## 字节码来历（可复现性记录）
+
+- 抽出时间：2026-11（维护者本机）。
+- 来源：本机**已注入补丁**的 Steam 版《千恋＊万花》`data.xp3`
+  （1,033,432,485 字节）中的 `startup.tjs` 条目。原始未改档
+  `data.xp3.back`（1,007,286,279 字节）保持原样，未参与抽取。
+- 归档内存放形态：该条目按**逐字节 XOR 0x01** 存放（头部因此是 `UKR3011`），
+  共 1404 字节；解码后即明文 `TJS2100` 字节码，仍是 1404 字节。`data.xp3`
+  里其它可变长度条目用的是同一个 XOR key。
+- 本仓库的 `data/startup.tjs.bin` 是上述**明文**形态（头部 `TJS2100`，
+  无 BOM、无额外头尾），1404 字节。
+- SHA-256：
+  `5F8B2FF6F75C587E4DC144759152B87AE84154BD7D96BD8AE493BE47C46F8322`
+- 对照件：原版（未注入）引擎启动脚本字节码为 1300 字节
+  （仅维护者本机参考，不入库）。1404 与 1300 的差异来自插件注册语句和
+  引擎/编译器版本差异；**不要**拿两者做二进制 diff 去"补"字节，二者不可互换。
+- 抽取工具：维护者本机的 XP3 解析/抽取脚本（按仓库策略不入库；产物即本 `.bin`）。
+
+## 为什么源码不入库
+
+- 游戏归档里的原版 `startup.tjs` 源码不在本仓库；它属于引擎侧启动脚本，
+  且与本作引擎版本绑定，入库既无必要也有版权/发布治理风险。
+- 重新编译它需要 32 位 `tjs2c.exe`（krkrz/TJS2 工具链），该外部工具**不在仓库里**，
+  干净克隆无法获得。发布构建因此直接使用已核实可用的 `.bin`。
+- 用已实测能启动游戏的字节码，比"重新编译一份看起来一样"的产物更可靠：
+  字节码与引擎版本、编译选项相关，重编可能产生不兼容产物。
+
+## 构建/发布里怎么用
+
+- `tools/build_injector.ps1`：默认读取 `data/startup.tjs.bin`，base64 后替换
+  `tools/inject_boot.cs` 里的 `BOOT_B64` 占位符，再用 .NET Framework 自带的
+  `csc.exe` 编译成注入工具 exe。**正常构建不调用 tjs2c**，干净克隆可复现。
+  只有显式传 `-Tjs2c` 且 `data/startup.tjs.bin` 不存在时，才回退到旧的
+  "用 tjs2c 编译源码"路径（重建源码时才需要）。
+- `tools/inject_boot.py`：`--bin` 指定字节码；不给 `--bin` 时默认读取本目录的
+  `data/startup.tjs.bin`；仅当它不存在时才回退到 `--script` + `--tjs2c`。
+- 安装器运行时会从**归档原条目**读出当时的 XOR key（当前观测为 0x01）再写入新
+  归档，因此 `.bin` 本身保持明文 TJS2100，不要预先 XOR。
+- 回归校验：从重建 exe 里解出的 `BOOT_B64` 解码后必须与 `data/startup.tjs.bin`
+  逐字节一致（2026-11 已实测通过）。
+
+## 如需从上游重建（一般不需要）
+
+1. 取 krkrz（KiriKiri Z）上游源码，按仓库 32 位工具链说明编译出 `tjs2c.exe`。
+2. 取**与本作引擎同版本**的标准 `startup.tjs`，把
+   `Plugins.link("a11y.dll");` 加进脚本，位置必须早于任何依赖插件的逻辑。
+3. 用 `tjs2c` 编译为 TJS2100 字节码（不同 tjs2c/引擎版本产物可能不同）。
+4. 用编译产物替换 `data/startup.tjs.bin` 后走正常构建：
+   `powershell -ExecutionPolicy Bypass -File tools\build_injector.ps1`
+   （或临时用 `-Tjs2c <path> -Script <源码路径>`，仅在 `.bin` 缺失时生效；
+   `tools/inject_boot.py --script <路径> --tjs2c <路径>` 同理）。
+5. 重建产物**必须**重新做真机冒烟（注入后的 `data.xp3` 能启动、插件能加载）后
+   才能替换已入库的 `.bin`；一般发布直接用现有 `.bin`。
+
+## 改动注意事项
+
+- **严禁修改 `data/startup.tjs.bin` 的字节**：不要用会改编码/加 BOM/加换行的
+  编辑器打开保存，不要格式化，不要预先 XOR。任何字节变化都会让字节码失效，
+  且 `BOOT_B64` 回归比对会失败。
+- 文件名 `data/startup.tjs` 与 `data/startup.tjs.bin` 不要互换：安装器只认
+  `.bin`；`data/startup.tjs`（本文件）若被当作源码传进 tjs2c 会编译失败。
+- `.gitignore` 的 `*.tjs` 规则会挡住本文件，需要仓库维护者加例外
+  （例如 `!data/startup.tjs`）；`data/startup.tjs.bin` 不受该规则影响。
+- 与游戏版本的关系：本 `.bin` 取自 2026-11 的 Steam 版 `data.xp3`（含已注入状态）。
+  若游戏大版本更新导致官方 `startup.tjs` 变化，应重新核对/重新抽取并做冒烟，
+  不能把官方新版启动脚本直接当作本补丁版本使用。
