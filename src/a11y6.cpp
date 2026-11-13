@@ -8,8 +8,9 @@
 //        diag / [朗读] 诊断日志出口（= A11yHost.Diag / CfgDiagLog）
 //   L3 逐作层
 //        文本抓取：kag.historyLayer.currentInfo（本作实测）
-//        界面导航：对 1920x1080 打网格问 getPrimaryLayerAt → 得到本作自己的
-//                  可点击图层清单；选中后对该图层发真鼠标点击（见文件后半段）
+//        界面导航：递归遍历 kag.primaryLayer 层树，收集可见、enabled、带
+//                  onMouseDown 的按钮层（无模式键）；选中后调该层自己的
+//                  onMouseDown/onMouseUp 事件（见文件后半段）
 //
 // 与前几版的区别（用户指出的不优雅之处）：
 //   * 没有宿主进程、没有命名管道、没有伴随窗口里的标准控件。
@@ -117,8 +118,7 @@ static volatile LONG g_quit = 0;
 static wchar_t g_exeDir[MAX_PATH];
 
 enum { TIMER_POLL = 1 };
-#define POLL_MS      200   // 平时：抓文本 + 导航
-#define SKIP_POLL_MS 100   // 快进时收紧：选项一出现要尽量早停手
+#define POLL_MS      200   // 平时：抓文本 + 导航巡检；界面常驻扫描按 400–500ms 节流
 
 // 诊断出口与开发用 REPL 通道由编译期开关 A11Y_DEV 统一控制：
 //   · 定义 A11Y_DEV（build\build.cmd dev）：与开发时完全一致 —— 诊断日志写
@@ -622,6 +622,7 @@ static wchar_t g_lastName[256];
 static wchar_t g_lastText[4096];
 static wchar_t g_lastAnnounced[4600];
 static bool    g_coverAnnounced = false;   // 启动「注意」声明只念一次
+static bool    g_isCover = false;     // 启动「注意」声明/封面盖屏中（PollDialogue 每拍更新）
 static volatile LONG g_pollBusy = 0;
 
 // ------------------------------------------------ 选项（分歧） ----------------
@@ -648,31 +649,6 @@ static int     g_choiceCount = 0;
 // 注意：kag.current 在**读档画面**上仍然是 表メッセージレイヤ0（陈旧值），
 // 所以它不能用来判断「现在是不是在剧情里」；kag.selectShowing 可以。
 static volatile LONG g_selectShowing = 0;
-
-// ------------------------------------------------------------------ 快进 -----
-//
-// 本作**完全不收键盘**（真键盘的空格/回车/以及 PostMessage 送进去的空格/回车，
-// 剧情都纹丝不动；只有鼠标点击能推进）。所以日式 AVG 惯例的「按住 Ctrl 快进」
-// 在本作里根本触发不了 —— Ctrl 是死的。这里由我们自己做：按住 Ctrl 时按固定
-// 节拍向消息区发合成点击，一旦 kag.selectShowing 变真就立刻停手，把选项让给
-// PollDialogue 去念（数字键选择那套）。
-//
-// 安全阀：不在剧情里时绝不能一直点（读档画面的存档格正好落在推进点上，
-// 连点可能变成双击 → 读档）。所以头几下是「试推」：每 600 ms 点一下（超过系统
-// 双击间隔），一旦文本变了才算确认进入剧情；试推期间文本不变就立刻收手。
-static bool  g_skip = false;
-static DWORD g_skipNext = 0;
-static DWORD g_skipBegan = 0;
-static int   g_skipClicks = 0;
-static int   g_skipStuck = 0;
-static bool  g_skipConfirmed = false;
-static wchar_t g_skipWatch[512];
-#define SKIP_PROBE_MS    600    // 试推节拍（大于系统双击间隔）
-#define SKIP_PROBE_TRIES 3      // 试推最多点几下
-#define SKIP_RUN_MS      SKIP_POLL_MS   // 确认后：跟着收紧后的定时器走
-#define SKIP_STUCK_LIMIT 6      // 确认后连续几拍文本没变就收手
-#define SKIP_MAX_CLICKS  4000
-
 
 // 假名（平假名/片假名）—— 中文译文里不该有
 static bool HasKana(const wchar_t *s)
@@ -776,6 +752,10 @@ enum {
 	P_KEY1, P_KEY2, P_GESTURE,
 	P_BACKEND, P_BACKEND_AUTO, P_BACKEND_SKIP,
 	P_BK_AUTO, P_BK_TOLK, P_BK_NVDA, P_BK_ZDSR, P_BK_SAPI,
+	// 无模式键模型用：Esc 从控件回到文本态 / 界面变化时报条目数 / 点不了的项
+	P_TEXT, P_ITEMS, P_DISABLED,
+	// 滑条读回真实值：P_SLIDER_NOW 带一个整数百分比，P_SLIDER_ADJ 用于读不到值
+	P_SLIDER_NOW, P_SLIDER_ADJ,
 	P_COUNT
 };
 
@@ -808,14 +788,13 @@ static const UiPhrase g_phrases[] = {
 	/* P_NO_WINDOW     */ { L"ゲームウィンドウが見つかりません。後でもう一度お試しください。", L"Game window not found; please try again later.", L"还没有找到游戏窗口，请稍后再试。", L"還沒有找到遊戲視窗，請稍後再試。" },
 	/* P_NOTICE        */ {
 		// 这里**故意不照抄游戏自己的声明原文**，只用我们自己的话说明「现在是什么画面、
-		// 按什么键过去」。理由见 README「内容边界」：那份声明是柚子社的文本，
+		// 它会自己关掉、不用操作」。理由见 README「内容边界」：那份声明是柚子社的文本，
 		// 而且它本来就是一张预渲染图片、屏幕阅读器取不到，我们只需要给一个功能提示。
-		L"この画面には、読み上げられないお知らせが表示されています。"
-		L"スペースか Enter で先に進みます。",
+		L"この画面には、読み上げられないお知らせが表示されています。約2秒で自動的に閉じます。",
 		L"This screen shows a notice that cannot be read out. "
-		L"Press Space or Enter to continue.",
-		L"当前画面是一段无法朗读的声明。按空格或回车继续。",
-		L"目前畫面是一段無法朗讀的聲明。按空格或 Enter 繼續。" },
+		L"It closes automatically in about two seconds.",
+		L"当前画面是一段无法朗读的声明，约两秒后会自动关闭，不需要操作。",
+		L"目前畫面是一段無法朗讀的聲明，約兩秒後會自動關閉，不需要操作。" },
 	/* P_NOTHING_READ  */ { L"まだ何も読み上げていません。", L"Nothing has been read yet.", L"还没有朗读过内容。", L"還沒有朗讀過內容。" },
 	/* P_LOADED        */ { L"アクセシビリティモジュールを読み込みました。音声バックエンド %s", L"Accessibility module loaded. Speech backend: %s", L"无障碍模块已加载，语音后端 %s", L"無障礙模組已載入，語音後端 %s" },
 	/* P_KEY1          */ { L"主キー", L"primary key", L"主键", L"主鍵" },
@@ -830,6 +809,12 @@ static const UiPhrase g_phrases[] = {
 	// 争渡读屏是中文产品名：日文/英文这两列用通用缩写 ZDSR，不硬造译名
 	/* P_BK_ZDSR       */ { L"ZDSR", L"ZDSR", L"争渡读屏", L"爭渡讀屏" },
 	/* P_BK_SAPI       */ { L"SAPI", L"SAPI", L"SAPI", L"SAPI" },
+	/* P_TEXT          */ { L"本文に戻りました。", L"Back to text.", L"回到文本。", L"回到文字。" },
+	/* P_ITEMS         */ { L"%d 項目。", L"%d items.", L"共 %d 项。", L"共 %d 項。" },
+	// 存档槽等 enabled==0 的项：点了游戏也不响应，明确说不通比假装点过好
+	/* P_DISABLED      */ { L"この項目は今は使えません。", L"This item is unavailable now.", L"这一项现在不可用。", L"這一項目前無法使用。" },
+	/* P_SLIDER_NOW    */ { L"現在 %d%%", L"Now %d%%", L"目前 %d%%", L"目前 %d%%" },
+	/* P_SLIDER_ADJ    */ { L"調整しました。", L"Adjusted.", L"已调整。", L"已調整。" },
 };
 // 表行数与 enum 必须一致：这里的 static_assert 就是防「加进 enum 却忘了加表行」——
 // 那种错会让后面每条文案整体移一位，界面上直接念出别的句子（历史上踩过一次）。
@@ -977,7 +962,7 @@ static void FetchMenuLabels(void)
 
 // 玩家可能在游戏里**中途**改界面语言（标题右上角 / 菜单），插件必须跟着换。
 // 检测搭在已有的 5Hz 轮询上（语言标签随 poll 一起回来，不多发 TJS 调用），
-// 这里只做节流：最快 800ms 认一次。定义在导航段（要用到 g_nav 等）。
+// 这里只做节流：最快 800ms 认一次；换语言后触发一次重扫（见导航段）。
 #define LANG_CHECK_MS 800
 static DWORD g_langCheckAt = 0;
 static void ApplyLanguageTag(const char *tag);
@@ -1118,6 +1103,7 @@ static void PollDialogue(void)
 
 	if(cover)
 	{
+		g_isCover = true;
 		if(!g_coverAnnounced)
 		{
 			g_coverAnnounced = true;
@@ -1128,6 +1114,7 @@ static void PollDialogue(void)
 		return;
 	}
 	g_coverAnnounced = false;
+	g_isCover = false;
 
 	// 倒数第三节是「这一句有没有配音」；同样从末尾往回取。
 	int voiced = 0;
@@ -1204,11 +1191,6 @@ static void PollDialogue(void)
 		wcsncpy_s(g_lastAnnounced, 4600, say, _TRUNCATE);
 		SpeechSpeak(say, true);
 	}
-	else if(g_skip)
-	{
-		// 快进时不朗读过路台词（免得语音队列把选项那一条淹了）；
-		// g_lastText 上面已经更新，快进的「推得动推不动」判据不受影响。
-	}
 	else if(voiced)
 	{
 		// 这一句**有配音**：人声已经在读了，不再叠一层 TTS。
@@ -1220,64 +1202,102 @@ static void PollDialogue(void)
 	}
 	else
 	{
-		SpeakLine(name, line);
+		// 原生快进（Ctrl）交给游戏自己，插件只负责「不逐句朗读」：快进时台词会在
+		// 极短时间内连续刷过，这里按最小间隔压掉过路台词，免得语音队列被灌满；
+		// 停下之后最后一句仍会正常播报（那时间隔已经超过阈值）。g_lastText 上面
+		// 已经更新，所以「退格重读这一句」不受影响。
+		static DWORD lastSpokenAt = 0;
+		DWORD now = GetTickCount();
+		if((long)(now - lastSpokenAt) < 250)
+		{
+			diag("rapid line -> tts suppressed: "); diagW(line); diag("\n");
+		}
+		else
+		{
+			lastSpokenAt = now;
+			SpeakLine(name, line);
+		}
 	}
 }
 
 // ====================================================== L3 逐作：界面导航 =====
 //
-// 与 A11yFramework/platform/UiNav.cs 同构，只是「控件」在本作里是 KAG 的**图层**：
+// 与 A11yFramework/platform/UiNav.cs 的「无模式键」模型同构，只是本作没有 Win32
+// 控件可枚举，「控件」是 KAG 的图层。这里走的是游戏自己的层树，不扫屏：
 //
-//   控件发现  对逻辑分辨率 1920x1080 打 40 px 网格，用 kag.getPrimaryLayerAt(x,y)
-//             问「这一点上是哪一层」，按层名去重 → 得到的就是**游戏自己的**可点击
-//             图层清单。实测：标题菜单 start/load/continue/flowchart/system/exit；
-//             游戏内底部工具栏 hold/custom/save/load/qsave/qload/option/prev/…/hide。
-//   激活      对该图层一个「确实命中过」的点发真的鼠标点击
-//             （WM_MOUSEMOVE + WM_LBUTTONDOWN/UP，走游戏自己的点击派发）。
-//             实测：点 start 进入正片、点 log 打开 BACKLOG、点 start 层中间推进对话。
-//   按键      Tab 进出导航；↑↓ 选择；回车/空格 激活；Home/End 首尾；
-//             PgUp/PgDn 前后跳 5 项；Esc 退出导航；Backspace 重读上一句。
+//   控件发现  从 kag.primaryLayer 递归遍历 children（深度 ≤4，按 name 找、不写死
+//             索引；探针实测 表メッセージレイヤ1 可能在 children[8] 也可能 [9]）。
+//             一个层是「控件」当且仅当：自己与全部祖先都可见/不透明、矩形与祖先
+//             容器求交后非空、尺寸不是整屏、且该层挂了 onMouseDown（滑条与存档槽
+//             按层名保底）。坐标一路累加父层 left/top；整屏容器、文本消息层不是
+//             控件（它们只是点击推进区）。层名一个都不许猜：全部来自探针转储。
+//   激活      直接调游戏自己的层事件：
+//                 layer.onMouseDown(w/2, h/2, 0, 0);
+//                 layer.onMouseUp  (w/2, h/2, 0, 0);
+//             这是探针实测走通的唯一动作入口（onClick 不是；窗口级 kag.onMouseDown
+//             也不派发）。存档槽在 enabled==1 时同样用层事件；enabled==0 的项明确
+//             播报「不可用」。**没有任何合成输入**：控件全部调游戏层事件，
+//             对话推进调 SystemAction._click()。
+//   按键      没有模式键：↑↓ 浏览、回车/空格 激活、←→ 调滑条、Backspace 重读、
+//             1–9 选项直选、0 停止朗读；Esc/Ctrl/R 原样交还游戏（不拦截、不改写）。
+//             g_sel = -1 表示文本态。
+//   对话推进  调游戏自己的动作 SystemAction._click()（探针实测一次一句），
+//             物理按键在窗口过程里吞掉，实测不会双推进。
 //
-// 纪律（同流水线 §7）：层名一个都不许猜 —— 全部来自上面的网格探针转储；
+// 纪律（同流水线 §7）：层名/坐标/动作入口全部来自探针转储与游戏自己的数据，
 // 别名表里没把握的层名就照念层名本身，绝不编一个中文词冒充。
 #define NAV_MAX_ITEMS 256
 #define NAV_HIST_MAX  200
 #define NAV_LOGICAL_W 1920
 #define NAV_LOGICAL_H 1080
-#define NAV_GRID 40
 
 struct NavItem {
 	char    name[64];
+	char    path[96];              // 层树路径 ".children[0].children[3]…"，激活时按它找层
 	wchar_t label[512];            // 回忆正文一整句可能很长（见 FetchHistory）
-	int hx, hy;                    // 命中的逻辑坐标；-1 = 不可点击（回忆正文）
+	int hx, hy;                    // 逻辑中心坐标；-1 = 不可点击（回忆正文）
 	int left, top, w, h;
-	bool isChild;                  // 是不是容器层的子控件（存档槽这类）
+	bool disabled;                 // true = enabled==0，游戏里这一项现在点不了
 };
 
 static NavItem g_items[NAV_MAX_ITEMS];
 static int     g_itemCount = 0;
 static bool    g_isBacklog = false;   // 本次扫描是不是回忆（BACKLOG）界面
-static bool    g_isCover = false;     // 本次扫描是不是启动「注意」声明画面
 static int     g_histCount = 0;       // 本次扫描插到最前面的正文条数
-static bool    g_nav = false;
-static int     g_sel = 0;
-static int     g_slidePct = 50;   // 滑条类控件当前用左/右键点到的百分比
+static int     g_sel = -1;   // -1 = 文本态（没有选中控件）；>=0 = 选中了第几项
 static bool    g_scanPending = false;
 static DWORD   g_scanAt = 0;
-static DWORD   g_rescanAt = 0;
-static int     g_scanTries = 0;
-static bool    g_scanOnEnter = false;   // 这一次扫描是不是「刚进导航模式」
+static DWORD   g_rescanAt = 0;      // 激活/切页后的一次加急重扫
+static DWORD   g_nextScanAt = 0;    // 平时的常驻巡检（没有模式键，界面随时可能出现）
 static HWND    g_gameWnd = NULL;
 static bool    g_subclassed = false;
-static char    g_namesBuf[8192];
+static char    g_namesBuf[8192];    // 上次**已播报**的清单（与 g_namesPrev 配合做去抖）
+static char    g_namesPrev[8192];   // 上一轮扫描的清单（连续两轮相同才算「稳定」）
+static char    g_prevFirstKey[192]; // 上一轮清单首项的键（换屏后把选中退回文本态）
 
 static void EnsureGameHook(void);   // 定义在下面（子类化游戏窗口）
+static bool IsSlider(const char *n);   // 定义在下面（滑条层名单）
+
+// 存档槽层名 item<行><列>（item00..item33）。探针实测：enabled==1 的槽位和普通
+// 按钮一样可以用层事件激活；这里认名字只是为了给盲人一个「存档位 N」的位置说法。
+static bool SlotLike(const char *n)
+{
+	if(!n || _strnicmp(n, "item", 4) != 0) return false;
+	return isdigit((unsigned char)n[4]) && isdigit((unsigned char)n[5]) && n[6] == 0;
+}
 
 // 表/裏/トップ这类图层族与整屏容器不是控件（尺寸过滤已在 TJS 侧做，这里是兜底）
 static bool Excluded(const char *name)
 {
 	if(!name[0]) return true;
 	if(_stricmp(name, "touchUI") == 0) return true;
+	if(_strnicmp(name, "ShowDate", 8) == 0) return true;   // 对话中显示的日期层，不是控件
+	// 「点击等待记号」：打字时跟着闪烁的 60x60 标记（visible 0/1 来回切）。它进清单会
+	// 让「界面已更新」每 500ms 播一次；正文态本来就该是 0 项，所以整族排除。
+	if(strstr(name, "\xE3\x82\xAF\xE3\x83\xAA\xE3\x83\x83\xE3\x82\xAF\xE5\xBE\x85\xE3\x81\xA1")) return true;  // クリック待ち
+	if(strstr(name, "\xE8\xA8\x98\xE5\x8F\xB7")) return true;   // 記号
+	// SystemBaseLayer 下的 "help tip"（注意名字中间有空格）：enabled=0 的提示文字层。
+	if(_stricmp(name, "help tip") == 0) return true;
 	if(strstr(name, "\xE3\x83\xAC\xE3\x82\xA4\xE3\x83\xA4")) return true;   // レイヤ
 	if(strncmp(name, "\xE8\xA1\xA8", 3) == 0) return true;                  // 表
 	if(strncmp(name, "\xE8\xA3\x8F", 3) == 0) return true;                  // 裏
@@ -1330,87 +1350,128 @@ static bool Excluded(const char *name)
 	{
 		size_t L = strlen(name);
 		if(L > 4 && _stricmp(name + L - 4, "_val") == 0) return true;
-		if(L > 8 && _stricmp(name + L - 8, "_num_bg") == 0) return true;
+		if(L > 7 && _stricmp(name + L - 7, "_num_bg") == 0) return true;
 		if(L > 5 && _stricmp(name + L - 5, "_rail") == 0) return true;
 	}
+	// 音频页最后一项的轨道层：轨道不是控件，滑条本体是 bgv2volume。
+	if(_stricmp(name, "bgv2") == 0) return true;
+	// 存档/读档界面槽位上的状态图标层（原始英文层名；槽位本身已有标签）。
+	if(_stricmp(name, "new") == 0) return true;
+	if(_stricmp(name, "to_save") == 0) return true;
+	// 标题画面/读档后的装饰性弹层（实测会瞬时 visible=1，被当成导航项多播一次）。
+	if(_stricmp(name, "MusicTitlePopupTip") == 0) return true;
 	return false;
 }
 
-// 网格探针：把「哪一层在哪一点上被命中」问出来，并把容器层的**子控件**也列出来。
+// 层树递归枚举：把游戏真正的可点层按 children 走一遍，全部按 name 找、不写死下标
+// （探针实测：同一界面 表メッセージレイヤ1 可能挂在 children[8]，也可能 [9]）。
 //
-// 依据（实机探针转储）：
-//   · 存档/读档界面的 16 个存档槽不是独立图层，而是 ParentHackLayer 的 children：
-//       ParentHackLayer rect=698,195,1104x720
-//       children[0]=item00 0,0,252x228   children[1]=item01 284,0,252x228  …
-//     子控件的坐标是**相对父层**的，所以绝对坐标 = 父层 left/top + 子控件 left/top。
-//   · 尺寸过滤的依据：整屏图层（表-背景 1920x1440、消息层 1920x1080）与容器层
-//     （touchUI 2763x282）都不是控件。
-//   · 每一次属性访问都必须单独 try/catch：实测有些点上 getPrimaryLayerAt 返回的
-//     不是 void，而是一个「半空」的包装对象，读 .name 就抛 "Accessing to null object"
-//     —— 曾因此整段扫描静默失败（表现为「探针脚本没有返回」）。
-// 控件发现：网格探针 + 容器子控件枚举。
+// 依据（实机探针转储，见 _a11y-sb\MIGRATION-FEASIBILITY.md 与 task-7 结论）：
+//   · 根用 kag.primaryLayer；表-背景/表メッセージレイヤ0/1 以及 SystemBaseLayer
+//     （确认框 MyYesNoDialogLayer 的宿主）都在它的子树里。
+//   · 可点击 = 该层自己的 onMouseDown 是 Object（探针实测的动作入口就是它；
+//     onClick 不是动作入口，窗口级 kag.onMouseDown 也不派发给 UI）。
+//   · 版面可见 = 自己 visible==1 && opacity>=128 && **全部祖先**都满足
+//     （隐藏界面里的子层 visible 仍是 1，只看自己会把另一屏的按钮收进来）。
+//   · 裁剪 = 与祖先容器矩形求交、中心落在交集里：存档网格第 4 行 item30..33
+//     在 ParentHackLayer（高 720）之外、visible 却仍是 1，必须剔掉。
+//   · 整屏容器 / 文本消息层不是控件：宽>1500 或高>900 的层不发射（它们只是
+//     「点击推进区」，不是可激活控件 —— 这也是 X4 那个「伪控件」问题的根）。
+//   · 坐标：绝对坐标 = 各级父层 left/top 累加；层路径一起带回去，激活时按路径
+//     直接取层，不再重复扫描（也避免了下标漂移）。
+//   · enabled：存档槽 enabled==0 时点了没反应；这里照样发射，用第二位记下来，
+//     C++ 侧激活时朗读「这一项现在不可用」，而不是假装点过。
 //
-// 【实测教训 · 设置界面】早先这里有一行 `if(w>=1900)continue;` 把整屏容器整层丢掉。
-// 设置界面的选项**全是** `表メッセージレイヤ1`（宽 1928）的子控件，于是四十多个子控件
-// 一起被丢，只剩下被 40px 网格恰好直接命中的那几个按钮层当「叶子」收进来 ——
-// 结果每个选项只碰到一半：显示模式只念到「全屏」念不到「窗口」，总在最前只念到「开」
-// 念不到「关」，老板键功能、显示说话人表情整行消失。
-// 现在：容器照样收集，然后用它的 children 发精确 rect；剩下的才当叶子层。
+// TJS 探针环境的三条坑（写在这里免得以后踩）：
+//   1) 不能用 function 声明、不能用 new Array(参数) —— 会不可捕获地终止脚本；
+//      数组一律用 [] 字面量。
+//   2) 每个属性访问单独 try/catch；层可能是 void，也可能是「半空」包装对象。
+//   3) 脚本必须 return "字符串"; 否则拿不到结果。
+//
+// 行格式（| 分隔每条）：B<can><en>\t<层名>\t<中心x>,<中心y>,<w>,<h>\t<层路径>|
+//   首段 F<回忆><注意声明>| 标明这一屏是不是回忆/启动注意声明。
+//   层路径形如 ".children[0].children[3]"。
 static const char *kScanScript =
-	"var r=\"\";var k=global.kag;"
-	"var NM=new Array();var HX=new Array();var HY=new Array();"
-	"var LL=new Array();var TT=new Array();var WW=new Array();var HH=new Array();"
-	"var OB=new Array();var KC=new Array();var SN=new Array();"
-	"for(var y=0;y<1080;y+=40){for(var x=0;x<1920;x+=40){"
-	"var l=k.getPrimaryLayerAt(x,y);if(l==void)continue;"
-	"var n=\"\";try{n=\"\"+l.name;}catch(g1){continue;}"
-	"if(n==\"\")continue;"
-	"var vis=1;var op=255;var w=0;var h=0;var lf=0;var tp=0;"
-	"try{vis=l.visible;}catch(g2){}"
-	"try{op=l.opacity;}catch(g3){}"
-	"if(vis!=1||op<128)continue;"
-	"try{w=l.width;}catch(g4){}"
-	"try{h=l.height;}catch(g5){}"
-	"try{lf=l.left;}catch(g6){}"
-	"try{tp=l.top;}catch(g7){}"
-	"var idx=-1;for(var i=0;i<NM.length;i++){if(NM[i]==n){idx=i;break;}}"
-	"if(idx<0){NM.push(n);HX.push(x);HY.push(y);LL.push(lf);TT.push(tp);"
-	"WW.push(w);HH.push(h);OB.push(l);KC.push(0);}"
-	"}}"
-	"for(var j=0;j<NM.length;j++){"
-	"var lay=OB[j];var cn=0;try{cn=lay.children.length;}catch(c0){cn=0;}"
-	"if(cn<2)continue;"
-	"for(var ci=0;ci<cn&&ci<120;ci++){"
-	"var c=void;try{c=lay.children[ci];}catch(c1){continue;}"
-	"if(c==void)continue;"
-	"var cnm=\"\";try{cnm=\"\"+c.name;}catch(c2){continue;}"
-	"if(cnm==\"\")continue;"
-	"var cv=1;try{cv=c.visible;}catch(c3){}"
-	"if(cv!=1)continue;"
-	"var cw=0;var chh=0;var cl=0;var ct=0;"
-	"try{cw=c.width;}catch(c4){}"
-	"try{chh=c.height;}catch(c5){}"
-	"try{cl=c.left;}catch(c6){}"
-	"try{ct=c.top;}catch(c7){}"
-	"if(cw<20||chh<20)continue;"
-	"if(cw>1600||chh>1000)continue;"
-	// 落在父容器之外的子控件是被裁掉的：实测存档网格 ParentHackLayer 高 720，
-	// 第 4 行 item30..item33 的 y=738 整行在容器外、画面上根本看不见，
-	// 但 visible 仍是 1 —— 收进来就是点不到的假控件。
-	"if(cl<-1||ct<-1||cl+cw>WW[j]+1||ct+chh>HH[j]+1)continue;"
-	"var dp=0;for(var d=0;d<SN.length;d++){if(SN[d]==cnm){dp=1;break;}}"
-	"if(dp==1)continue;"
-	"SN.push(cnm);KC[j]=1;"
-	"r+=\"C\\t\"+cnm+\"\\t\"+(LL[j]+cl+cw/2)+\",\"+(TT[j]+ct+chh/2)+\",\"+cw+\",\"+chh+\",\"+NM[j]+\"|\";"
-	"}}"
-	"for(var m=0;m<NM.length;m++){"
-	"if(KC[m]==1)continue;"
-	"if(WW[m]>1600||HH[m]>1000||WW[m]<20||HH[m]<20)continue;"
-	"var dp2=0;for(var e2=0;e2<SN.length;e2++){if(SN[e2]==NM[m]){dp2=1;break;}}"
-	"if(dp2==1)continue;"
-	"r+=\"L\\t\"+NM[m]+\"\\t\"+HX[m]+\",\"+HY[m]+\",\"+WW[m]+\",\"+HH[m]+\"|\";"
+	"var r=\"\";var bk=0;var cv=0;var dlg=0;"
+	"var k=null;try{k=global.kag;}catch(e0){k=null;}"
+	"if(k==null)return \"F00|\";"
+	"var root=null;try{root=k.primaryLayer;}catch(e00){root=null;}"
+	"if(root==null)return \"F00|\";"
+	// 滑条层名单须与 C++ 的 g_sliderNames 保持一致：滑条的左右键调值是靠层事件
+	// 落在指定百分比位置实现的，有些滑条层不一定挂了 onMouseDown，这里按名单保底。
+	"var SL=[\"chaphidetime\",\"mushidetime\",\"gamespeed\",\"voicespeed\",\"skipspeed\","
+	"\"textspeed\",\"autospeed\",\"winopac\",\"wavevolume\",\"bgmvolume\",\"downvolume\","
+	"\"sevolume\",\"syssevolume\",\"movievolume\",\"voicevolume\",\"bgvvolume\","
+	"\"chvolume\",\"sysvovolume\",\"bgv2volume\"];"
+	"var LQ=[root];var XQ=[0];var YQ=[0];var DQ=[0];var GQ=[0];"
+	"var A1=[0];var A2=[0];var A3=[1920];var A4=[1080];var PQ=[\"\"];"
+	"var RQ=[];var FQ=[];"
+	"for(var qi=0;qi<LQ.length&&qi<1200;qi++){"
+	"var l=LQ[qi];var ax=XQ[qi];var ay=YQ[qi];var d=DQ[qi];"
+	"var c1=A1[qi];var c2=A2[qi];var c3=A3[qi];var c4=A4[qi];"
+	// 属性读取一律带「缺省值 + 类型/空值判定」：TJS 里没定义的成员读出来是
+	// undefined（typeof 得 "undefined"），若直接 var v=l.props 再拿去比较/相加，
+	// 整条子树会被判成不可见或坐标变成 NaN —— 层树里总有一两个裸层没有
+	// visible/opacity 属性，所以这里逐个 try 并保留缺省值。
+	"var n=\"\";try{var nv=l.name;if(typeof nv!=\"undefined\"&&nv!=null)n=\"\"+nv;}catch(e1){n=\"\";}"
+	"var vis=1;try{var v1=l.visible;if(typeof v1!=\"undefined\"&&v1!=null)vis=(v1==1?1:0);}catch(e2){}"
+	"var op=255;try{var v2=l.opacity;if(typeof v2!=\"undefined\"&&v2!=null)op=v2;}catch(e3){}"
+	"var lf=0;try{var v3=l.left;if(typeof v3!=\"undefined\"&&v3!=null)lf=v3;}catch(e4){}"
+	"var tp=0;try{var v4=l.top;if(typeof v4!=\"undefined\"&&v4!=null)tp=v4;}catch(e5){}"
+	"var ww=0;try{var v5=l.width;if(typeof v5!=\"undefined\"&&v5!=null)ww=v5;}catch(e6){}"
+	"var hh=0;try{var v6=l.height;if(typeof v6!=\"undefined\"&&v6!=null)hh=v6;}catch(e7){}"
+	"var mx=ax+lf;var my=ay+tp;"
+	"var n1=c1;var n2=c2;var n3=c3;var n4=c4;"
+	"if(ww>0&&hh>0){if(mx>n1)n1=mx;if(my>n2)n2=my;if(mx+ww<n3)n3=mx+ww;if(my+hh<n4)n4=my+hh;}"
+	"var ev=1;if(vis!=1)ev=0;if(op<128)ev=0;if(c1>=c3||c2>=c4)ev=0;"
+	"var ud=GQ[qi];"
+	"if(ev==1){"
+	"if(n==\"blockBaseLayer\"||n==\"caption_backlog\")bk=1;"
+	"if(n==\"SysCoverLayer\")cv=1;"
+	// 模态隔离（实机：读档确认框出现时底层槽位和弹窗按钮混在一起）：名字里含
+	// dialog/Dialog 的可见层视为模态根，只保留它子树里的项，别让焦点跑到弹窗后面。
+	"var isD=0;for(var di=0;di+6<=n.length;di++){"
+	"if((n.charAt(di)==\"d\"||n.charAt(di)==\"D\")&&n.charAt(di+1)==\"i\"&&n.charAt(di+2)==\"a\"&&"
+	"n.charAt(di+3)==\"l\"&&n.charAt(di+4)==\"o\"&&n.charAt(di+5)==\"g\"){isD=1;break;}}"
+	"if(isD==1){ud=1;dlg=1;}"
+	"if(n!=\"\"&&ww>=8&&hh>=8&&ww<=1500&&hh<=900){"
+	// TJS 里 typeof null 也是 "Object"，不能拿 typeof 判「有没有挂处理函数」；
+	// 必须先取出来判 null / undefined（探针实测 typeof 判断会对所有层成立）。
+	"var can=0;try{var md=l.onMouseDown;if(md!=null&&typeof md!=\"undefined\")can=1;}catch(e8){}"
+	"var en=1;try{var ev1=l.enabled;if(typeof ev1!=\"undefined\"&&ev1!=null)en=(ev1==1?1:0);}catch(e9){}"
+	"var isS=0;for(var si=0;si<SL.length;si++){if(SL[si]==n){isS=1;break;}}"
+	// 存档槽层名 item<行><列>：探针实测 enabled==1 时同样响应层事件，但个别槽位
+	// 可能没挂 onMouseDown，这里按名字保底收进来（enabled 位交给 C++ 判）。
+	"var isI=0;if(n.length==6){if(n.charAt(0)==\"i\"&&n.charAt(1)==\"t\"&&n.charAt(2)==\"e\"&&"
+	"n.charAt(3)==\"m\"&&n.charAt(4)>=\"0\"&&n.charAt(4)<=\"9\"&&"
+	"n.charAt(5)>=\"0\"&&n.charAt(5)<=\"9\")isI=1;}"
+	// 模态框子树里只收真正的按钮（yes/no/chk）：标题/正文层也带原生 onMouseDown
+	// 方法（TJS 里 typeof 判不出「有没有挂处理器」），点它没意义，只会让用户先听到
+	// 一个没用的「讀取進度 / overwrite」再按一下。
+	"var okb=1;if(ud==1){if(!(n==\"yes\"||n==\"no\"||n==\"chk\"))okb=0;}"
+	"if(okb==1&&(can==1||isS==1||isI==1)){"
+	"var ccx=mx+ww/2;var ccy=my+hh/2;"
+	"if(ccx>=n1&&ccx<=n3&&ccy>=n2&&ccy<=n4&&ccx>=0&&ccy>=0&&ccx<=1920&&ccy<=1080){"
+	"RQ.push(\"B\"+can+en+\"\\t\"+n+\"\\t\"+ccx+\",\"+ccy+\",\"+ww+\",\"+hh+\"\\t\"+PQ[qi]+\"|\");FQ.push(ud);"
+	"}}}"
+	// 收掉 if(ev==1){ 的括号：原先少一个右花括号，整段脚本解析失败（scan 永远空）。
 	"}"
-	"return r;";
+	"if(ev==1&&d<4){"
+	"var cn=0;try{cn=l.children.length;}catch(ea){cn=0;}"
+	"if(cn>100)cn=100;"
+	"for(var ci=0;ci<cn;ci++){"
+	"if(LQ.length>=1200)break;"
+	"var c=null;try{c=l.children[ci];}catch(eb){c=null;}"
+	"if(c==null)continue;"
+	"LQ.push(c);XQ.push(mx);YQ.push(my);DQ.push(d+1);GQ.push(ud);"
+	"A1.push(n1);A2.push(n2);A3.push(n3);A4.push(n4);"
+	"PQ.push(PQ[qi]+\".children[\"+ci+\"]\");"
+	"}"
+	"}"
+	"}"
+	"if(dlg==1){for(var ri=0;ri<RQ.length;ri++){if(FQ[ri]==1)r+=RQ[ri];}}"
+	"else{for(var rj=0;rj<RQ.length;rj++){r+=RQ[rj];}}"
+	"return \"F\"+bk+cv+dlg+\"|\"+r;";
 
 // 层名 → 中文标签。每条的依据都写在注释里（层名来自探针转储，中文来自界面截图核对）。
 // 想改标签不必重新编译：把同名的行写进 plugin\a11y_labels.ini，ini 里的会覆盖这里。
@@ -1461,6 +1522,11 @@ static const NameAlias g_alias[] = {
 	{ "edithold",  L"选中编辑按钮" },
 	{ "title",     L"回到标题界面" },
 	{ "title2",    L"回到标题界面" },
+	// ---- 确认框（task-7 实测：SystemBaseLayer→MyYesNoDialogLayer→dialog.children）----
+	// 子层名是 yes/no/chk 这种英文，画面上是「是／否」和勾选框，换成自然中文再念。
+	{ "yes",       L"是" },
+	{ "no",        L"否" },
+	{ "chk",       L"確定" },
 	{ "to_quick",  L"快速读档" },
 	{ "to_voice",  L"语音收藏夹" },
 	// 同样两个界面来回切：存档页上它写「读档」，读档页上写「存档」，取中性说法
@@ -1591,6 +1657,8 @@ static const NameAlias g_alias[] = {
 	{ "movievolume",  L"视频音量（滑条）" },
 	{ "voicevolume",  L"角色语音（滑条）" },
 	{ "bgvvolume",    L"背景语音（普通）（滑条）" },
+	// 音频页最后一项；语义待人工确认（task-7 只确认它是滑条本体）。
+	{ "bgv2volume",   L"背景語音 2（滑條）" },
 	{ "chv_on",       L"单独设置每个角色的语音：开" },
 	{ "chv_off",      L"单独设置每个角色的语音：关" },
 	{ "chv_test",     L"试听角色语音" },
@@ -1951,7 +2019,8 @@ static int FetchHistory(int cap)
 					else       _snwprintf_s(it->label, 512, _TRUNCATE, L"%ls %ls", num, line);
 					it->hx = -1; it->hy = -1;
 					it->left = made; it->top = made; it->w = 0; it->h = 0;
-					it->isChild = false;
+					it->path[0] = 0;          // 回忆正文没有对应的可点层
+					it->disabled = false;
 					made++;
 				}
 			}
@@ -2110,10 +2179,10 @@ static void ApplyLanguageTag(const char *tag)
 	FetchMenuLabels();
 	LoadUserLabels();
 	BuildGeneratedAliases();
-	if(g_nav)
+	if(g_namesBuf[0] || g_namesPrev[0])
 	{
 		g_namesBuf[0] = 0;            // 清掉缓存的名字串，逼「界面已更新」那条播报出来
-		g_scanOnEnter = false;
+		g_namesPrev[0] = 0;
 		g_scanPending = true;
 		g_scanAt = GetTickCount() + 150;
 	}
@@ -2131,48 +2200,60 @@ static void ScanItems(void)
 	if(!out) { diag("scan: 探针脚本没有返回\n"); return; }
 
 	int slotSeq = 0;
+	bool dlg = false;   // 本轮有可见的模态确认框：只收它的子树
 	char *p = out;
+	// 首段：F<回忆><注意声明><模态框>| —— TJS 侧把这一屏的性质放在最前面，省得靠层名猜。
+	{
+		char *fbar = (p[0] == 'F') ? strchr(p, '|') : NULL;
+		if(fbar)
+		{
+			if(fbar > p + 1) g_isBacklog = (p[1] == '1');
+			if(fbar > p + 2) g_isCover   = (p[2] == '1');
+			if(fbar > p + 3) dlg         = (p[3] == '1');
+			p = fbar + 1;
+		}
+	}
 	while(*p && g_itemCount < NAV_MAX_ITEMS)
 	{
 		char *bar = strchr(p, '|');
 		if(bar) *bar = 0;
-		// 形如  C\t<名>\t<x,y,w,h,父层名>   或   L\t<名>\t<x,y,w,h>
-		if(p[0] && p[1] == '\t')
+		// 形如  B<can><en>\t<层名>\t<x>,<y>,<w>,<h>\t<层路径>
+		if(p[0] == 'B' && p[1] && p[2] && p[3] == '\t')
 		{
-			char kind = p[0];
-			char *nm = p + 2;
+			bool en = (p[2] == '1');
+			char *nm = p + 4;
 			char *tab = strchr(nm, '\t');
 			if(tab)
 			{
 				// 必须先把制表符打成字符串结尾：不这么做，nm 会连父层名一起带走
-				// （"helpbase\t1384,99,…,表メッセージレイヤ0"），而 Excluded() 的规则是
-				// 「名字里含 レイヤ 就当噪声」—— 父层名里的 レイヤ 被带进来，
-				// **每一项都会被丢掉**，表现为扫描恒返回 0 项、导航里按方向键一片死寂。
+				// （"helpbase\t1384,99,…"），而 Excluded() 的规则是「名字里含 レイヤ
+				// 就当噪声」—— 父层名里的 レイヤ 被带进来，**每一项都会被丢掉**，
+				// 表现为扫描恒返回 0 项、方向键一片死寂（历史坑）。
 				*tab = 0;
+				char *rect = tab + 1;
+				char *tab2 = strchr(rect, '\t');
+				if(tab2) *tab2 = 0;
 				// 坐标必须按**浮点**解析：TJS 侧发的是控件中心，宽高为奇数时就是
-				// 167.5 这种半像素值。原先用 "%d,%d,%d,%d" —— %d 读到 '167' 后
-				// 撞上 '.' 就整个中止，后面 y/w/h 全部留 0，排序键与点击点一起烂掉
-				// （实测症状：标题菜单念成 开始→退出→流程图→系统设置→继续→语言→读取，
-				//   以及激活控件时点到 (x,0) 即屏幕最顶端，看起来就是「点了没反应」）。
+				// 167.5 这种半像素值；用 %d 会在 '.' 处中止，y/w/h 全留 0，
+				// 排序键与点击点一起烂掉。
 				double dx = 0, dy = 0, dw = 0, dh = 0;
-				char parent[64]; parent[0] = 0;
-				int got = sscanf_s(tab + 1, "%lf,%lf,%lf,%lf,%63s",
-					&dx, &dy, &dw, &dh, parent, (unsigned)sizeof(parent));
-				if(got >= 2)
+				int got = sscanf_s(rect, "%lf,%lf,%lf,%lf", &dx, &dy, &dw, &dh);
+				if(got == 4 && tab2 && tab2[1])
 				{
 					int x = (int)(dx + 0.5), y = (int)(dy + 0.5);
 					int w = (int)(dw + 0.5), h = (int)(dh + 0.5);
-					if(_stricmp(nm, "blockBaseLayer") == 0 ||
-					   _stricmp(nm, "caption_backlog") == 0) g_isBacklog = true;
-					if(_stricmp(nm, "SysCoverLayer") == 0) g_isCover = true;
-					if(!Excluded(nm))
+					// 确认框子树里的 text 是消息正文层（不是按钮），不当导航项。
+					if(w > 0 && h > 0 && x >= 0 && y >= 0 &&
+					   x <= NAV_LOGICAL_W && y <= NAV_LOGICAL_H && !Excluded(nm) &&
+					   !(dlg && _stricmp(nm, "text") == 0))
 					{
 						NavItem *it = &g_items[g_itemCount];
 						strncpy_s(it->name, sizeof(it->name), nm, _TRUNCATE);
+						strncpy_s(it->path, sizeof(it->path), tab2 + 1, _TRUNCATE);
 						it->hx = x; it->hy = y;
 						it->left = x - w / 2; it->top = y - h / 2;
 						it->w = w; it->h = h;
-						it->isChild = (kind == 'C');
+						it->disabled = !en;
 						LabelOf(it->name, it->label, 128);
 						g_itemCount++;
 					}
@@ -2190,8 +2271,7 @@ static void ScanItems(void)
 	{
 		for(int i = 0; i < g_itemCount; i++)
 		{
-			if(g_items[i].isChild && _strnicmp(g_items[i].name, "item", 4) == 0 &&
-			   isdigit((unsigned char)g_items[i].name[4]))
+			if(SlotLike(g_items[i].name))
 			{
 				slotSeq++;
 				// 保底说法：bookmark API 万一拿不到东西，也不至于念出 item00
@@ -2224,6 +2304,26 @@ static void ScanItems(void)
 			}
 		}
 	}
+	// 同一个控件被两套层树同时列出：QuickMenu 实测 children[2..22] 与 children[25..46]
+	// 是两套同名、同坐标、都 visible=1 的按钮（task-7 层 dump 确认），不去重会念两遍。
+	// 按 name + rect 去重，只留扫描顺序里的第一个（同 rect 不同名的父/子层交给下面那条规则）。
+	{
+		int keep = 0;
+		for(int i = 0; i < g_itemCount; i++)
+		{
+			bool dup = false;
+			for(int j = 0; j < keep; j++)
+			{
+				if(_stricmp(g_items[j].name, g_items[i].name) == 0 &&
+				   g_items[j].left == g_items[i].left && g_items[j].top == g_items[i].top &&
+				   g_items[j].w == g_items[i].w && g_items[j].h == g_items[i].h)
+				{ dup = true; break; }
+			}
+			if(!dup) g_items[keep++] = g_items[i];
+		}
+		g_itemCount = keep;
+	}
+
 	// 按「先上后下、先左后右」排成阅读顺序。
 	// 探针的发现顺序是按图层树的，念起来前后乱跳（设置界面实测：先念底部按钮，
 	// 再念最上面的页签，中间夹着零散按钮）。位置排序后就是人看界面的顺序：
@@ -2241,38 +2341,23 @@ static void ScanItems(void)
 		g_items[b + 1] = key;
 	}
 
-	// 同一块地方同时被「容器子控件」和「网格叶子」命中时只留子控件。
-	// 实测：设置界面底部 1351,992 既被网格叶子 title2 命中、又是子控件 back
-	// （同一 rect），两个都收会连着念两遍「回到游戏」。
+	// 同一块地方被两层同时命中（父按钮层套子按钮层）只留更深的那层：深的更贴近
+	// 实际控件，按路径激活时点中的也才是真正的按钮。
 	{
 		int keep = 0;
 		for(int i = 0; i < g_itemCount; i++)
 		{
 			bool dup = false;
-			if(!g_items[i].isChild)
+			for(int j = 0; j < g_itemCount; j++)
 			{
-				for(int j = 0; j < g_itemCount; j++)
-				{
-					if(j == i || !g_items[j].isChild) continue;
-					if(g_items[j].left == g_items[i].left && g_items[j].top == g_items[i].top &&
-					   g_items[j].w == g_items[i].w && g_items[j].h == g_items[i].h) { dup = true; break; }
-				}
+				if(j == i) continue;
+				if(g_items[j].left == g_items[i].left && g_items[j].top == g_items[i].top &&
+				   g_items[j].w == g_items[i].w && g_items[j].h == g_items[i].h &&
+				   strlen(g_items[j].path) > strlen(g_items[i].path)) { dup = true; break; }
 			}
 			if(!dup) g_items[keep++] = g_items[i];
 		}
 		g_itemCount = keep;
-	}
-
-	// 启动「注意」声明：整屏只有一张图，不是控件，所以补一个「整屏可点」的项，
-	// 让回车/空格能把它关掉（真键盘的空格本来也能关，这里只是给导航模式一个出口）。
-	if(g_isCover && g_itemCount < NAV_MAX_ITEMS)
-	{
-		NavItem *it = &g_items[g_itemCount++];
-		strncpy_s(it->name, sizeof(it->name), "SysCoverLayer", _TRUNCATE);
-		wcsncpy_s(it->label, 512, L"注意声明（按回车关闭）", _TRUNCATE);
-		it->hx = 960; it->hy = 540;
-		it->left = 0; it->top = 0; it->w = NAV_LOGICAL_W; it->h = NAV_LOGICAL_H;
-		it->isChild = false;
 	}
 
 	// 回忆界面：正文放最前面（先念内容再念按钮）。
@@ -2290,35 +2375,102 @@ static void ScanItems(void)
 		}
 	}
 
+	// 换屏后旧选中项没有意义（实机：工具栏第 7 项进设置后第一次 ↓ 落在「鍵盤。8 / 48」）：
+	// 首项层路径一变就把选中退回文本态；回忆正文没有路径，用名字+位置代替。
+	{
+		char firstKey[192];
+		firstKey[0] = 0;
+		if(g_itemCount > 0)
+		{
+			if(g_items[0].path[0])
+				_snprintf_s(firstKey, sizeof(firstKey), _TRUNCATE, "%s", g_items[0].path);
+			else
+				_snprintf_s(firstKey, sizeof(firstKey), _TRUNCATE, "%s|%d,%d,%d,%d",
+					g_items[0].name, g_items[0].left, g_items[0].top, g_items[0].w, g_items[0].h);
+		}
+		if(strcmp(firstKey, g_prevFirstKey) != 0)
+		{
+			g_sel = -1;
+			g_lastAnnounced[0] = 0;   // 上一屏的重读缓存也一起作废
+		}
+		strcpy_s(g_prevFirstKey, firstKey);
+	}
+
+#ifdef A11Y_DEV
+	// 开发辅助（发布构建整段不编译）：本轮清单（路径+标签）与上一轮不同且非空时，
+	// 打一行「dev items: 0=标签1 | 1=标签2 | …」（最多 40 项，超长截断），
+	// 冒烟时不必逐项按方向键就能核对模态隔离/换屏重置。
+	{
+		static wchar_t devSig[8192];
+		wchar_t sig[8192];
+		sig[0] = 0;
+		int so = 0;
+		for(int i = 0; i < g_itemCount && so >= 0 && so < 7936; i++)
+		{
+			so += _snwprintf_s(sig + so, 8192 - so, _TRUNCATE,
+				L"%hs|%.64ls\n", g_items[i].path, g_items[i].label);
+			if(so < 0) { so = (int)wcslen(sig); break; }
+		}
+		if(g_itemCount > 0 && wcscmp(sig, devSig) != 0)
+		{
+			wchar_t line[4096];
+			int off = _snwprintf_s(line, 4096, _TRUNCATE, L"dev items:");
+			for(int i = 0; i < g_itemCount && i < 40 && off >= 0 && off < 4080; i++)
+			{
+				int n = _snwprintf_s(line + off, 4096 - off, _TRUNCATE,
+					L" %d=%ls |", i, g_items[i].label);
+				if(n < 0) break;
+				off += n;
+			}
+			if(off > 0) { diagWN(line, -1); diag("\n"); }
+		}
+		wcsncpy_s(devSig, 8192, sig, _TRUNCATE);
+	}
+#endif
+
 	diagf("scan: %d 个控件\n", g_itemCount);
 }
 
-// 「点这个点一定命中该图层」→ 直接发鼠标点击，游戏自己派发
-static void ClickLogical(int lx, int ly)
+// 调游戏自己的层事件：把鼠标按下/抬起直接发给层对象（探针实测这是游戏真正的
+// 动作入口；必须先 down 后 up、缺一不可，坐标是**层内局部坐标**，点宽高中心
+// 即可）。path 是扫描时带回的层树路径（".children[a].children[b]"），按路径找层
+// 可以避开下标漂移。动作异步生效，结果靠下一次常驻扫描观察，这里只报告事件是否
+// 成功发出（true 不等于界面已经切换）。
+static bool ActivateLayerByPath(const char *path, int localX, int localY)
 {
-	if(!g_gameWnd) return;
-	RECT rc; GetClientRect(g_gameWnd, &rc);
-	int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-	if(cw <= 0 || ch <= 0) return;
-	int cx = (int)((double)lx * cw / (double)NAV_LOGICAL_W);
-	int cy = (int)((double)ly * ch / (double)NAV_LOGICAL_H);
-	if(cx < 0) cx = 0; if(cx >= cw) cx = cw - 1;
-	if(cy < 0) cy = 0; if(cy >= ch) cy = ch - 1;
-	LPARAM lp = MAKELPARAM(cx, cy);
-	PostMessageW(g_gameWnd, WM_MOUSEMOVE, 0, lp);
-	PostMessageW(g_gameWnd, WM_LBUTTONDOWN, MK_LBUTTON, lp);
-	PostMessageW(g_gameWnd, WM_LBUTTONUP, 0, lp);
-	diagf("click logical (%d,%d) -> client (%d,%d)\n", lx, ly, cx, cy);
+	if(!path || !path[0]) return false;
+	char code[1024];
+	_snprintf_s(code, sizeof(code), _TRUNCATE,
+		"var l=null;try{l=global.kag.primaryLayer%s;}catch(e0){return \"no\";}"
+		"if(l==null)return \"no\";"
+		"var x=%d;var y=%d;"
+		"try{l.onMouseDown(x,y,0,0);}catch(e1){return \"no\";}"
+		"try{l.onMouseUp(x,y,0,0);}catch(e2){return \"no\";}"
+		"return \"ok\";",
+		path, localX, localY);
+	char *out = NULL;
+	ExecOnMainThread(code, &out);
+	bool ok = out && strcmp(out, "ok") == 0;
+	if(out) free(out);
+	if(!ok) { diag("activate layer failed: "); diag(path); diag("\n"); }
+	return ok;
 }
 
-// 底部工具栏会自己滑走；进导航前先晃一下鼠标把它叫回来（探针实测有效）
-static void WakeToolbar(void)
+// 推进剧情：调游戏自己的动作 SystemAction._click()（探针实测一次一句；引擎自己
+// 把推进节流在 ~2.5 句/秒）。本作剧情推进走 DirectInput 状态轮询、不走窗口消息，
+// 所以「按一下推进一句」只能由我们主动调游戏动作；物理按键我们在窗口过程里吞掉，
+// 实测不会双推进（task-7：游戏收不到送进窗口的键盘，一次按键正好一句）。
+static void AdvanceStory(void)
 {
-	if(!g_gameWnd) return;
-	RECT rc; GetClientRect(g_gameWnd, &rc);
-	int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-	if(cw <= 0 || ch <= 0) return;
-	PostMessageW(g_gameWnd, WM_MOUSEMOVE, 0, MAKELPARAM(cw / 2, ch - 40));
+	static const char *kClick =
+		"var r=\"no\";try{var a=global.SystemAction;"
+		"if(a!=void){if(a._click!=void){a._click();r=\"ok\";}}}catch(e){r=\"no\";}"
+		"return r;";
+	char *out = NULL;
+	ExecOnMainThread(kClick, &out);
+	bool ok = out && strcmp(out, "ok") == 0;
+	if(out) free(out);
+	if(!ok) diag("advance: SystemAction._click 不可用\n");
 }
 
 static void NavAnnounce(const wchar_t *prefix)
@@ -2326,40 +2478,15 @@ static void NavAnnounce(const wchar_t *prefix)
 	if(g_itemCount == 0) { SpeechSpeak(Ph(P_NOITEM), true); return; }
 	if(g_sel < 0) g_sel = 0;
 	if(g_sel >= g_itemCount) g_sel = g_itemCount - 1;
-	g_slidePct = 50;   // 换了控件，滑条百分比从头开始
 	wchar_t say[1024];
 	_snwprintf_s(say, 1024, _TRUNCATE, L"%ls%ls。%d / %d",
 		prefix ? prefix : L"", g_items[g_sel].label, g_sel + 1, g_itemCount);
 	SpeechSpeak(say, true);
 }
 
-static void NavExit(bool announce)
-{
-	diag("NavExit\n");
-	g_nav = false;
-	g_scanPending = false;
-	g_itemCount = 0;
-	if(announce) SpeechSpeak(Ph(P_NAV_EXIT), true);
-}
-
-static void NavEnter(void)
-{
-	if(!g_gameWnd) { SpeechSpeak(Ph(P_NO_WINDOW), true); return; }
-	diag("NavEnter\n");
-	WakeToolbar();
-	g_nav = true;
-	g_sel = 0;
-	g_itemCount = 0;
-	g_scanTries = 0;
-	g_scanOnEnter = true;
-	g_scanPending = true;
-	g_scanAt = GetTickCount() + 400;   // 等工具栏滑出来再扫
-	SpeechSpeak(Ph(P_NAV_ENTER), true);
-}
-
 static void NavActivate(void)
 {
-	if(g_itemCount == 0) { NavExit(false); return; }
+	if(g_itemCount == 0 || g_sel < 0 || g_sel >= g_itemCount) return;
 	NavItem *it = &g_items[g_sel];
 	// 回忆正文不可点击（hx<0）：回车＝重念这一句。绝不能发鼠标事件 ——
 	// 消息窗那一片底下就是「推进剧情」的命中区，点下去会把剧情推走。
@@ -2369,99 +2496,32 @@ static void NavActivate(void)
 		SpeechSpeak(it->label, true);
 		return;
 	}
+	if(it->disabled)
+	{
+		diag("activate(disabled) "); diagW(it->label);
+		SpeechSpeak(Ph(P_DISABLED), true);
+		return;
+	}
 	wchar_t say[600];
 	_snwprintf_s(say, 600, _TRUNCATE, Ph(P_ACTIVATED), it->label);
 	SpeechSpeak(say, true);
 	diag("activate "); diagW(it->label);
-	ClickLogical(it->hx, it->hy);
+	// 全部控件（含存档槽、确认框 yes/no、滑条）都走游戏自己的层事件；
+	// 层事件失败时明确说「不可用」，绝不盲点。
+	if(!ActivateLayerByPath(it->path, it->w / 2, it->h / 2))
+		SpeechSpeak(Ph(P_DISABLED), true);
 	g_rescanAt = GetTickCount() + 600;
 }
 
-// 本作实测：**只有点击能推进剧情** —— 真键盘的空格/回车、以及 PostMessage 送进去的
-// 空格/回车，剧情都纹丝不动（对比：同样方式点击消息区立刻出下一句）。
-// 所以「空格/回车 = 推进剧情」这一条必须由我们自己发点击来实现。
-#define ADVANCE_X 960
-#define ADVANCE_Y 800
-
-// ---------------------------------------------------------------- 快进 ------
-static void SkipStop(const wchar_t *say)
-{
-	if(!g_skip) return;
-	g_skip = false;
-	if(g_hWnd) SetTimer(g_hWnd, TIMER_POLL, POLL_MS, NULL);   // 定时器恢复平时的节拍
-	diagf("skip stop: clicks=%d confirmed=%d\n", g_skipClicks, g_skipConfirmed ? 1 : 0);
-	if(say) SpeechSpeak(say, true);
-}
-
-static void SkipStart(void)
-{
-	if(g_skip) return;
-	if(g_nav) { SpeechSpeak(Ph(P_SKIP_NONAV), true); return; }
-	if(!g_lastText[0]) { SpeechSpeak(Ph(P_SKIP_NOTEXT), true); return; }
-	g_skip = true;
-	g_skipBegan = GetTickCount();
-	g_skipNext = g_skipBegan + SKIP_PROBE_MS;
-	g_skipClicks = 0;
-	g_skipStuck = 0;
-	g_skipConfirmed = false;
-	wcsncpy_s(g_skipWatch, 512, g_lastText, _TRUNCATE);
-	if(g_hWnd) SetTimer(g_hWnd, TIMER_POLL, SKIP_POLL_MS, NULL);
-	diag("skip start\n");
-	SpeechSpeak(Ph(P_SKIP_START), true);
-}
-
-static void SkipTick(void)
-{
-	if(!g_skip) return;
-	// 选项出现 → 立刻收手，让 PollDialogue 去念选项（数字键选择那套）
-	if(g_selectShowing > 0 || g_choiceCount > 0) { SkipStop(NULL); return; }
-	if(!GetAsyncKeyState(VK_CONTROL))
-	{
-		// 松手：播报结束，并把当前这一句读出来（快进期间过路台词是不念的，
-		// 不补这一下，盲人松开 Ctrl 后会不知道自己停在哪）
-		bool spoke = g_skipConfirmed;
-		SkipStop(spoke ? Ph(P_SKIP_END) : NULL);
-		if(spoke && g_lastText[0]) SpeakLine(g_lastName, g_lastText);
-		return;
-	}
-
-	DWORD now = GetTickCount();
-	if((long)(now - g_skipNext) < 0) return;
-
-	// 文本变了吗？快进期间不朗读，但 g_lastText 照常更新，用来看「推得动推不动」
-	if(wcscmp(g_skipWatch, g_lastText) != 0)
-	{
-		wcsncpy_s(g_skipWatch, 512, g_lastText, _TRUNCATE);
-		g_skipStuck = 0;
-		if(!g_skipConfirmed) { g_skipConfirmed = true; diag("skip confirmed\n"); }
-	}
-	else if(++g_skipStuck >= (g_skipConfirmed ? SKIP_STUCK_LIMIT : SKIP_PROBE_TRIES))
-	{
-		// 试推期推不动 = 根本不在剧情里（读档画面的存档格正好压在推进点上，
-		// 连点可能变成双击 → 读档），所以试推只允许点 SKIP_PROBE_TRIES 下就收手。
-		SkipStop(g_skipConfirmed ? Ph(P_SKIP_STUCK) : Ph(P_SKIP_NOTADV));
-		return;
-	}
-	if(g_skipClicks >= SKIP_MAX_CLICKS) { SkipStop(Ph(P_SKIP_END)); return; }
-
-	// 引擎自己把推进节流在 ~2.5 句/秒（实测：点 17.8 下/秒也只到 2.3 句/秒，
-	// 而采样器是 5 Hz —— 引擎若真更快，每次采样都会看到新行）。所以**不要**多发点击，
-	// 一拍一下刚好；多发只是让引擎丢消息，一点也不快。
-	ClickLogical(ADVANCE_X, ADVANCE_Y);
-	g_skipClicks++;
-	g_skipNext = GetTickCount() + (g_skipConfirmed ? SKIP_RUN_MS : SKIP_PROBE_MS);
-	(void)now;
-}
-
-// 设置页里实测到的滑条（层名来自逐页探针转储）：点左右两端的百分比位置就是设值。
-// 全部是横向滑条（426x35 或 282x34），所以「left + w*百分比」这个算法通用。
+// 设置页里实测到的滑条（层名来自逐页探针转储）。全部是横向滑条（426x35 或 282x34）：
+// 对层发 md+mu 时「点击方向」决定走一步 ±10（task-7 实测），点左端近缘减、右端近缘加。
 static const char *g_sliderNames[] = {
 	"chaphidetime", "mushidetime",                              // 画面显示页
 	"gamespeed", "voicespeed", "skipspeed",                     // 游戏设置 2
 	"textspeed", "autospeed", "winopac",                        // 文本
 	"wavevolume", "bgmvolume", "downvolume", "sevolume",        // 音频
 	"syssevolume", "movievolume", "voicevolume", "bgvvolume",
-	"chvolume", "sysvovolume",
+	"chvolume", "sysvovolume", "bgv2volume",
 };
 
 static bool IsSlider(const char *n)
@@ -2471,8 +2531,47 @@ static bool IsSlider(const char *n)
 	return false;
 }
 
-// 数字键选择选项：用游戏自己给的按钮矩形中心点击（矩形来自 selectLayer.selects[i]，
-// 实测 459,244,1002x146，与画面上那两条一致，不是我们猜的布局）。
+// 读回滑条的真实值（task-7 实测：只有这 9 个滑条能读到 kag.<同名>，0..1 的 Real）。
+// 读不到就不编百分比，只说「已调整」——真实值以游戏为准。
+static const char *g_sliderValueNames[] = {
+	"wavevolume", "bgmvolume", "sevolume", "voicevolume", "syssevolume",
+	"textspeed", "autospeed", "voicespeed", "skipspeed",
+};
+
+static bool ReadSliderPercent(const char *name, int *outPct)
+{
+	bool known = false;
+	for(int i = 0; i < (int)(sizeof(g_sliderValueNames) / sizeof(g_sliderValueNames[0])); i++)
+		if(_stricmp(name, g_sliderValueNames[i]) == 0) { known = true; break; }
+	if(!known) return false;   // 名字来自上面的白名单，字母，可安全拼进脚本
+
+	char code[256];
+	sprintf_s(code, sizeof(code),
+		"var v=null;try{v=kag.%s;}catch(e){}"
+		"if(typeof v==\"undefined\"||v==null)return \"\";"
+		"return \"\"+v;", name);
+	char *out = NULL;
+	ExecOnMainThread(code, &out);
+	if(!out) return false;
+	char tmp[64];
+	strncpy_s(tmp, sizeof(tmp), out, _TRUNCATE);
+	free(out);
+	if(!tmp[0]) return false;
+	char *end = NULL;
+	double v = strtod(tmp, &end);
+	if(!end || end == tmp) return false;
+	// Real 0..1 视为百分比；已经是 0..100 的值就原样。
+	double pct = (v <= 1.2) ? (v * 100.0 + 0.5) : (v + 0.5);
+	if(pct < 0) pct = 0;
+	if(pct > 100) pct = 100;
+	*outPct = (int)pct;
+	return true;
+}
+
+// 数字键选择选项：按层名在本次扫描结果里找到选项层，再调它自己的层事件。
+// 选项层名来自游戏数据（kPoll 的 selectLayer.selects[i]）；激活时在本次扫描结果
+// 里按层名找到选项层，再调它自己的层事件。扫描还没追上时明确说「不可用」，
+// 不猜坐标、也不发任何合成输入。
 static void SelectChoice(int i)
 {
 	if(i < 0 || i >= g_choiceCount) return;
@@ -2480,8 +2579,14 @@ static void SelectChoice(int i)
 	_snwprintf_s(say, 256, _TRUNCATE, Ph(P_SELECTED), g_choiceLabels[i]);
 	wcsncpy_s(g_lastAnnounced, 4600, say, _TRUNCATE);
 	SpeechSpeak(say, true);
-	ClickLogical(g_choiceRect[i][0] + g_choiceRect[i][2] / 2,
-	             g_choiceRect[i][1] + g_choiceRect[i][3] / 2);
+	bool done = false;
+	for(int k = 0; k < g_itemCount; k++)
+	{
+		if(_stricmp(g_items[k].name, g_choiceNames[i]) != 0) continue;
+		done = ActivateLayerByPath(g_items[k].path, g_items[k].w / 2, g_items[k].h / 2);
+		break;
+	}
+	if(!done) { diag("select: choice layer not in scan\n"); SpeechSpeak(Ph(P_DISABLED), true); }
 	g_rescanAt = GetTickCount() + 600;
 }
 
@@ -2822,10 +2927,9 @@ static void CycleSpeechBackend(void)
 }
 
 // 「这一下该不该管」—— 按本插件既有的输入约定：
-//   · 还没找到游戏窗口 → 不管（NavEnter 也是这个判据：找不到窗口只念一句提示）
+//   · 还没找到游戏窗口 → 不管（找不到窗口只念一句提示）
 //   · 前台不是本进程的窗口 → 不管（玩家可能在别的程序里按切换热键干别的事，
 //     那时候插一句播报只会更吵）
-//   · 正在快进 → 不管（快进是我们自己连点出来的状态，插一脚会打乱它「松手播报」的节奏）
 static bool HotkeyContextOk(void)
 {
 	if(!g_gameWnd) return false;
@@ -2833,11 +2937,10 @@ static bool HotkeyContextOk(void)
 	DWORD pid = 0;
 	if(fg) GetWindowThreadProcessId(fg, &pid);
 	if(pid != GetCurrentProcessId()) return false;
-	if(g_skip) return false;
 	return true;
 }
 
-// 每拍查一次键状态（200 ms；快进时是 100 ms，但快进期间不动作）。不吞键。
+// 每拍查一次键状态（200 ms）。不吞键。
 static void HotkeyTick(void)
 {
 	if(!g_hotkeyVk) return;
@@ -2858,172 +2961,206 @@ static void HotkeyTick(void)
 	CycleSpeechBackend();
 }
 
-// 返回 true = 这一下按键由我们处理（游戏看不到它）
+// 返回 true = 这一下按键由我们处理（游戏看不到它）；false = 原样交给游戏。
+//
+// 无模式键状态机（框架第 0 条纪律）：g_sel = -1 表示「文本态（没有选中控件）」，
+// g_sel >= 0 表示选中了界面上的第几项。两种状态共用同一组键，不需要模式键：
+//   回车/空格   选中控件 → 激活；文本态 → 推进一句（SystemAction._click）
+//   ↑/↓          有控件 → 在控件间移动（从文本态进入时 ↑ 落到最后一项、↓ 落到第一项）
+//               没有控件 → 不做动作（不抢文本）
+//   ←/→         仅当选中项是滑条时调值并读回真实值，其它不动作
+//   Esc         选中控件 → 清掉选中、播报「回到文本」；文本态 → 交还游戏
+//   Backspace   选中项 → 重读该项；文本态 → 重读上一句台词
+//   0            停止朗读（沉默，0.2.7.3）
+//   1–9         选项界面直选（SelectChoice）
+//   Ctrl/R 等   不拦截、不改写，原样交给游戏
 static bool NavKeyDown(WPARAM vk, bool repeat)
 {
 	if(repeat) return false;   // 长按重复交给系统；我们只在「新的一次按下」上动作
+	// 0 = 沉默（0.2.7.3 公约）：两种状态都吞掉，不让游戏吃到。
+	if(vk == '0') { SpeechStop(); return true; }
 
-	// Ctrl = 快进（本作不收键盘，引擎自己的 Ctrl 快进是死的，只能我们自己连点）
-	if(vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
+	// 封面/logo 期间不扫描、不响应其它键；只吞回车/空格（约 2 秒自动淡出）。
+	if(g_isCover)
 	{
-		SkipStart();
-		return true;
+		if(vk == VK_RETURN || vk == VK_SPACE) return true;
+		return false;
 	}
-	if(g_skip && vk == VK_ESCAPE)
-	{
-		SkipStop(L"快进已停止。");
-		return true;
-	}
-	if(vk == VK_TAB)
-	{
-		if(g_nav) NavExit(true); else NavEnter();
-		return true;
-	}
+
 	if(vk == VK_BACK)
 	{
-		if(g_lastAnnounced[0]) SpeechSpeak(g_lastAnnounced, true);
+		if(g_sel >= 0) NavAnnounce(NULL);
+		else if(g_lastAnnounced[0]) SpeechSpeak(g_lastAnnounced, true);
 		else SpeechSpeak(Ph(P_NOTHING_READ), true);
 		return true;
 	}
-	// 选项场景：数字键 1..9 = 选择对应选项（用游戏自己的按钮矩形点击）
+	// 选项场景：数字键 1..9 = 选择对应选项
 	if(vk >= '1' && vk <= '9' && g_choiceCount > 0)
 	{
 		int n = (int)(vk - '1');
 		if(n < g_choiceCount) SelectChoice(n);
 		return true;
 	}
-	// 非导航模式下，空格/回车 = 推进剧情。
-	// 实测（真键盘、游戏窗口在前台）：按一下正好推进一句，不重复。游戏自己是收真键盘的
-	// （真按 Ctrl 会快进），但走的是 DirectInput/键盘状态轮询，不经过窗口消息 ——
-	// 所以我们 PostMessage 送进去的空格游戏看不见，这一下点击是给「我们送进去的键」用的。
-	if(!g_nav && (vk == VK_SPACE || vk == VK_RETURN))
+
+	// Esc：有选中 → 清掉选中、回到文本态（不触发游戏自己的 Esc 动作）；
+	// 文本态 → 不拦截，交还游戏。
+	if(vk == VK_ESCAPE)
 	{
-		ClickLogical(ADVANCE_X, ADVANCE_Y);
+		if(g_sel < 0) return false;
+		g_sel = -1;
+		SpeechSpeak(Ph(P_TEXT), true);
 		return true;
 	}
-	if(!g_nav) return false;
+
+	// 回车/空格：选中了控件就激活它；文本态就推进一句。
+	// 探针结论（task-7）：游戏收不到我们窗口里的键盘；SystemAction._click() 一次
+	// 正好推进一句，不会双推进，所以吞键 + 调 _click 是安全的。
+	if(vk == VK_RETURN || vk == VK_SPACE)
+	{
+		bool scannedNow = false;
+		// 界面刚切换时巡检可能还没扫到：先同步补扫一次，再按补扫后的 g_sel 决定
+		// 动作（实机 bug：补扫后直接 return 会把这一下回车吞掉，用户以为没反应）。
+		if(g_scanPending)
+		{
+			g_scanPending = false;
+			ScanItems();
+			scannedNow = true;
+			g_nextScanAt = GetTickCount() + (g_itemCount > 0 ? 500 : 400);
+			char cur[8192]; cur[0] = 0;
+			for(int i = 0; i < g_itemCount; i++)
+			{
+				strncat_s(cur, sizeof(cur), g_items[i].name, _TRUNCATE);
+				strncat_s(cur, sizeof(cur), "|", _TRUNCATE);
+			}
+			bool changed = (strcmp(cur, g_namesBuf) != 0);
+			strcpy_s(g_namesPrev, cur);
+			if(g_itemCount > 0 && changed && !g_isCover)
+			{
+				strcpy_s(g_namesBuf, cur);
+				wchar_t say[256];
+				int off = _snwprintf_s(say, 256, _TRUNCATE, L"%ls", Ph(P_UPDATED));
+				if(off > 0) _snwprintf_s(say + off, 256 - off, _TRUNCATE, Ph(P_ITEMS), g_itemCount);
+				SpeechSpeak(say, true);
+			}
+		}
+		if(g_sel >= 0) { NavActivate(); return true; }
+		// 启动「注意」声明：约 2 秒后自动淡出，无需点击（探针实测），只吞键。
+		if(g_isCover) return true;
+		// 刚补扫出界面（换屏）：这一下只播报、不推进剧情。
+		if(scannedNow && g_itemCount > 0) return true;
+		AdvanceStory();
+		return true;
+	}
+
+	if(g_itemCount == 0) return false;   // 文本态：其余键都交还游戏
 
 	switch(vk)
 	{
-	case VK_UP:
-		if(g_itemCount == 0) return true;
-		g_sel = (g_sel - 1 + g_itemCount) % g_itemCount;
-		NavAnnounce(NULL);
-		return true;
 	case VK_DOWN:
-		if(g_itemCount == 0) return true;
-		g_sel = (g_sel + 1) % g_itemCount;
+		if(g_sel < 0) g_sel = 0;
+		else g_sel = (g_sel + 1) % g_itemCount;
 		NavAnnounce(NULL);
 		return true;
-	case VK_HOME:
-		if(g_itemCount == 0) return true;
-		g_sel = 0; NavAnnounce(NULL);
-		return true;
-	case VK_END:
-		if(g_itemCount == 0) return true;
-		g_sel = g_itemCount - 1; NavAnnounce(NULL);
-		return true;
-	case VK_PRIOR:
-		if(g_itemCount == 0) return true;
-		g_sel -= 5; if(g_sel < 0) g_sel = 0;
+	case VK_UP:
+		if(g_sel < 0) g_sel = g_itemCount - 1;
+		else g_sel = (g_sel - 1 + g_itemCount) % g_itemCount;
 		NavAnnounce(NULL);
-		return true;
-	case VK_NEXT:
-		if(g_itemCount == 0) return true;
-		g_sel += 5; if(g_sel >= g_itemCount) g_sel = g_itemCount - 1;
-		NavAnnounce(NULL);
-		return true;
-	case VK_RETURN:
-	case VK_SPACE:
-		NavActivate();
 		return true;
 	case VK_LEFT:
 	case VK_RIGHT:
 	{
-		if(g_itemCount == 0) return true;
+		if(g_sel < 0) return false;   // 文本态：左右键交给游戏
 		NavItem *it = &g_items[g_sel];
 		if(!IsSlider(it->name)) { SpeechSpeak(Ph(P_SLIDER_NO), true); return true; }
-		g_slidePct += (vk == VK_RIGHT) ? 10 : -10;
-		if(g_slidePct < 0) g_slidePct = 0;
-		if(g_slidePct > 100) g_slidePct = 100;
-		wchar_t say[64];
-		_snwprintf_s(say, 64, _TRUNCATE, Ph(P_SLIDER_PCT), g_slidePct);
-		SpeechSpeak(say, true);
-		ClickLogical(it->left + it->w * g_slidePct / 100, it->top + it->h / 2);
+		// 滑条层只认「点击方向」：一次点击固定走一步 ±10，不会跳到点击的百分比
+		// 位置（task-7 实测）。右方向键点右端近缘、左方向键点左端近缘，稳定触发一步。
+		int lx = (vk == VK_RIGHT) ? (it->w - 2) : 1;
+		if(lx < 1) lx = 1;
+		if(lx >= it->w) lx = it->w - 1;
+		if(!ActivateLayerByPath(it->path, lx, it->h / 2))
+		{
+			SpeechSpeak(Ph(P_DISABLED), true);
+			return true;
+		}
+		// 不编百分比：点完读回游戏真实值；读不到就只说「已调整」。
+		int pct = -1;
+		if(ReadSliderPercent(it->name, &pct))
+		{
+			wchar_t say[64];
+			_snwprintf_s(say, 64, _TRUNCATE, Ph(P_SLIDER_NOW), pct);
+			SpeechSpeak(say, true);
+		}
+		else SpeechSpeak(Ph(P_SLIDER_ADJ), true);
 		return true;
 	}
-	case VK_ESCAPE:
-		NavExit(true);
-		return true;
 	}
+	// Esc 以及其余按键：不拦截，原样交给游戏
 	return false;
 }
 
-// 每 200 ms 一次的导航小状态机（跟着抓文本的定时器走，不额外起线程）
+// 每 200 ms 一次的导航巡检（跟着抓文本的定时器走，不额外起线程）。
+// 没有模式键：不能等玩家按 Tab 才开始扫 —— 界面随时可能出现，所以常驻巡检。
 static void NavTick(void)
 {
 	if(!g_subclassed) EnsureGameHook();
 
-	SkipTick();
+	if(g_isCover)
+	{
+		// 封面盖着时后面还压着标题按钮：不扫、不播，免得空报「界面已更新」。
+		if(g_itemCount)
+		{
+			g_itemCount = 0;
+			g_sel = -1;
+			g_namesBuf[0] = 0;
+			g_namesPrev[0] = 0;
+		}
+		g_scanPending = false;
+		g_rescanAt = 0;
+		return;
+	}
 
-	if(g_nav && g_rescanAt && (long)(GetTickCount() - g_rescanAt) >= 0)
+	DWORD now = GetTickCount();
+	if(g_rescanAt && (long)(now - g_rescanAt) >= 0)
 	{
 		g_rescanAt = 0;
 		g_scanPending = true;
-		g_scanAt = GetTickCount();
+		g_scanAt = now;
 	}
-
-	if(g_nav && g_scanPending && (long)(GetTickCount() - g_scanAt) >= 0)
+	if(!g_scanPending && (long)(now - g_nextScanAt) >= 0)
 	{
-		g_scanPending = false;
-		ScanItems();
+		g_scanPending = true;
+		g_scanAt = now;
+	}
+	if(!g_scanPending || (long)(now - g_scanAt) < 0) return;
 
-		// 清单变了吗？（框架的做法：变了就播报「界面已更新」，否则不出声）
-		char now[8192]; now[0] = 0;
-		for(int i = 0; i < g_itemCount; i++)
-		{
-			strncat_s(now, sizeof(now), g_items[i].name, _TRUNCATE);
-			strncat_s(now, sizeof(now), "|", _TRUNCATE);
-		}
-		bool changed = (strcmp(now, g_namesBuf) != 0);
-		strcpy_s(g_namesBuf, now);
+	g_scanPending = false;
+	ScanItems();
+	// 界面上有控件时 500ms 巡检一次（要能看见弹窗出现/界面切换），纯文本态 400ms
+	// 更省一点也无所谓 —— 层树只有一两百个节点，比旧网格扫屏便宜一个量级。
+	g_nextScanAt = GetTickCount() + (g_itemCount > 0 ? 500 : 400);
 
-		if(g_itemCount == 0)
-		{
-			// 标题菜单是淡入的、面板也要滑出来 —— 一次没扫到不算「没有控件」。
-			// 连扫几次都没东西才认输（框架里对应的就是 SceneSettleSeconds 那道门禁）。
-			if(g_scanTries < 8)
-			{
-				g_scanTries++;
-				g_scanPending = true;
-				g_scanAt = GetTickCount() + 700;
-				return;
-			}
-			SpeechSpeak(L"当前界面上没有可操作的项目。", true);
-			NavExit(false);
-			return;
-		}
-		g_scanTries = 0;
-		if(g_sel >= g_itemCount) g_sel = g_itemCount - 1;
+	// 清单变了吗？KAG 的层会自己闪烁（「点击等待记号」visible 0/1 来回切），单轮变化
+	// 不代表界面切换：**连续两轮清单相同**、且与上次已播报的不同，才播「界面已更新」。
+	char cur[8192]; cur[0] = 0;
+	for(int i = 0; i < g_itemCount; i++)
+	{
+		strncat_s(cur, sizeof(cur), g_items[i].name, _TRUNCATE);
+		strncat_s(cur, sizeof(cur), "|", _TRUNCATE);
+	}
+	bool stable = (strcmp(cur, g_namesPrev) == 0);
+	strcpy_s(g_namesPrev, cur);
 
-		// 播报规则与框架一致：
-		//   刚进导航模式   → 「导航模式，共 N 项，<当前项>。i / N」
-		//   激活后清单变了 → 「界面已更新，<当前项>。i / N」
-		//   激活后没变化   → 不出声（免得每点一下都念一遍）
-		if(g_scanOnEnter)
-		{
-			// 回忆界面：进来时停在**最新一句**上（正文按时间从旧到新排，
-			// 停在第一条会让盲人从几十句之前开始听）
-			if(g_isBacklog && g_histCount > 0) g_sel = g_histCount - 1;
-			wchar_t pfx[64];
-			_snwprintf_s(pfx, 64, _TRUNCATE, Ph(P_NAV_ON), g_itemCount);
-			g_scanOnEnter = false;
-			NavAnnounce(pfx);
-		}
-		else if(changed)
-		{
-			NavAnnounce(Ph(P_UPDATED));
-		}
+	// 选中项可能因为切界面而失效：静默退回文本态（不念「没有项目」，免得吵）
+	if(g_sel >= g_itemCount) g_sel = -1;
+
+	if(g_itemCount > 0 && stable && strcmp(cur, g_namesBuf) != 0 && !g_isCover)
+	{
+		// 只报「界面变了、有几项」；选中留给玩家自己按方向键（无模式键模型）。
+		strcpy_s(g_namesBuf, cur);
+		wchar_t say[256];
+		int off = _snwprintf_s(say, 256, _TRUNCATE, L"%ls", Ph(P_UPDATED));
+		if(off > 0) _snwprintf_s(say + off, 256 - off, _TRUNCATE, Ph(P_ITEMS), g_itemCount);
+		SpeechSpeak(say, true);
 	}
 }
 
@@ -3111,7 +3248,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall V2Link(void *exporterptr)
 		if(s) s[1] = 0;
 	}
 	diag("exeDir="); diagW(g_exeDir);
-	diag("== a11y6 build: CtrlFastForward + selectShowing + digit-choice + ZDSR + Alt+Shift+F9 speech-backend switch ==\n");
+	diag("== a11y6 build: no-mode nav (layer tree + layer events) + SystemAction._click + digit-choice + ZDSR + Alt+Shift+F9 speech-backend switch ==\n");
 	LoadUserLabels();
 	BuildGeneratedAliases();
 

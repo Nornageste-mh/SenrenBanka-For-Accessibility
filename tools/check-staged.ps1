@@ -1,6 +1,9 @@
 ﻿# ============================================================================
 #  check-staged.ps1 —— 提交前守卫（千恋＊万花 / KiriKiri Z 路线）.
 #
+#  0.2.0.0 起界面操作 = 无模式键（方向键直接选、Enter/Space 激活、Esc 返回），.
+#  旧的 Tab / 导航模式已删；下面的文档断言按这个新口径查。.
+#
 #  这一版要挡什么（P8 提交前守卫 + IP 红线）：.
 #    · 分析笔记 / 反编译产物 / 逆向工具的输出（这些留本地，不入库）。.
 #    · 游戏资源与脚本：*.xp3 / *.psb / *.ks / *.scn / *.pimg / *.ogg 等。.
@@ -11,9 +14,9 @@
 #
 #  机械断言（不依赖人的自觉，任一条不满足就 exit 1）：.
 #    · docs\交互形态判定.md 存在，且 §1 已填 A/B/C 结论（勾选或「结论：X 类」）。.
-#    · docs\操作约定.md 存在。.
-#    · README 主要快捷键表里，Tab 相关行必须标「遗留」（或不进推荐表）。.
-#    · mod\package\安装说明.md / 常见问题.md 存在，且不得把 Tab 模式写成推荐。.
+#    · docs\操作约定.md 存在，且「是否使用遗留导航模式」= 否（0.2.0.0 起无模式键）。.
+#    · 仓库文档不得把「按 Tab 进入 / 先按 Tab / 导航模式」写成推荐用法（历史说明放行）。.
+#    · README「主要快捷键」附近必须声明「无需模式键 / 不需要按任何模式键」。.
 #    · 版本三处一致：README 当前版本 = CHANGELOG 顶部标题 = dist 里最新包名（若已打包）。.
 #
 #  用法：.
@@ -23,7 +26,7 @@
 #  退出码：0 = PASS；1 = 命中禁止项或断言失败。.
 #
 #  【为什么暂存区为空也要跑】发布前 git add 之后才是完整的闸，但「文件内容对不对」.
-#  不依赖暂存区：README 的遗留标注、判定文件的结论、版本一致性随时可查。.
+#  不依赖暂存区：文档的无模式键口径、判定文件的结论、版本一致性随时可查。.
 #  所以暂存区为空时只跳过「暂存扫描」，内容断言照跑。.
 #
 #  【坑 · 本文件每条注释都以 ASCII 字符结尾，别改成中文标点】。.
@@ -221,16 +224,80 @@ if (-not (Test-Path -LiteralPath $judgePath)) {
     }
 }
 
-# 2b. 操作约定。.
+# 2b. 操作约定：「是否使用遗留导航模式」必须 = 否（0.2.0.0 起无模式键）。.
 $opsPath = Join-Path $root 'docs\操作约定.md'
+$readmePath = Join-Path $root 'README.md'
 if (-not (Test-Path -LiteralPath $opsPath)) {
     Add-Fail "缺少 docs\操作约定.md（第 0 条纪律的交付物：操作逻辑公约的落地说明）"
 } else {
-    Add-Ok "docs\操作约定.md 已存在"
+    $opsLines = [IO.File]::ReadAllLines($opsPath, [Text.Encoding]::UTF8)
+    $idx = -1
+    for ($i = 0; $i -lt $opsLines.Count; $i++) {
+        if ($opsLines[$i] -match '遗留导航模式') { $idx = $i; break }
+    }
+    if ($idx -lt 0) {
+        Add-Fail "docs\操作约定.md 里找不到「是否使用遗留导航模式」条目（0.2.0.0 起应填「否」）"
+    } else {
+        $line = $opsLines[$idx]
+        $ln = $idx + 1
+        $yesChecked = ($line -match '[☑✓√●▓]\s*\**\s*是')
+        $noChecked = ($line -match '[☑✓√●▓]\s*\**\s*否')
+        if ($yesChecked) {
+            Add-Fail "docs\操作约定.md 第 $ln 行仍写着「使用遗留导航模式 = 是」，应改为「☑ 否」或「否（0.2.0.0 起移除）」：$($line.Trim())"
+        } elseif ($noChecked -or ($line -match '否' -and $line -notmatch '是')) {
+            Add-Ok "docs\操作约定.md 已登记「不使用遗留导航模式」（第 $ln 行）"
+        } else {
+            Add-Fail "docs\操作约定.md 第 $ln 行的「遗留导航模式」条目判不出「否」（写成「☑ 否」或「否（0.2.0.0 起移除）」）：$($line.Trim())"
+        }
+    }
 }
 
-# 2c. README 主要快捷键表：Tab 行必须标「遗留」（或不进推荐表）。.
-$readmePath = Join-Path $root 'README.md'
+# 2c. 五份文档不得把「按 Tab 进入 / 先按 Tab / 导航模式」写成推荐用法。.
+#     只拦「要求玩家按模式键」的句子；「已移除 / 不再需要 Tab」这类历史说明放行。.
+$modeKeyDocs = @(
+    @{ Path = $readmePath; Label = 'README.md' },
+    @{ Path = (Join-Path $root 'mod\package\安装说明.md'); Label = 'mod\package\安装说明.md' },
+    @{ Path = (Join-Path $root 'mod\package\常见问题.md'); Label = 'mod\package\常见问题.md' },
+    @{ Path = (Join-Path $root 'docs\交互形态判定.md'); Label = 'docs\交互形态判定.md' },
+    @{ Path = (Join-Path $root 'docs\操作约定.md'); Label = 'docs\操作约定.md' }
+)
+$historyWords = '(已移除|已删除|已废弃|移除|删除|废弃|作废|不再需要|不再|不需要|无需|不用|不提供|未提供|不是推荐|不推荐|不得|禁止|没有|無|无模式键|历史)'
+$badModePatterns = @(
+    @{ Re = '(先|首先|然后|再|请|需要|須|须)\s*(按|按下|敲|点)?\s*.{0,4}Tab'; Why = '「先按 Tab」' },
+    @{ Re = '(按|按下|敲)\s*.{0,4}Tab\s*.{0,6}(进入|退出|打开|开启|切换|启动)'; Why = '「按 Tab 进入」' },
+    @{ Re = 'Tab\s*.{0,8}(进入|退出|打开|开启|切换|启动).{0,12}(导航|界面)'; Why = '「Tab 进入导航模式」' },
+    @{ Re = '(进入|打开|开启|切换|使用|启用)\s*.{0,6}(导航模式|导航)'; Why = '「进入导航模式」' },
+    @{ Re = '导航模式\s*.{0,8}(推荐|建议|默认|首选|请用|使用)'; Why = '把「导航模式」写成推荐/默认' }
+)
+$modeKeyHits = 0
+foreach ($doc in $modeKeyDocs) {
+    if (-not (Test-Path -LiteralPath $doc.Path)) {
+        Add-Fail "缺少 $($doc.Label)（无模式键口径的文档断言要读它）"
+        continue
+    }
+    $docLines = [IO.File]::ReadAllLines($doc.Path, [Text.Encoding]::UTF8)
+    $offenders = New-Object Collections.Generic.List[string]
+    for ($i = 0; $i -lt $docLines.Count; $i++) {
+        $text = $docLines[$i]
+        if ($text -notmatch 'Tab|导航模式|模式键') { continue }
+        if ($text -match $historyWords) { continue }
+        foreach ($p in $badModePatterns) {
+            if ($text -match $p.Re) {
+                [void]$offenders.Add("第 $($i + 1) 行（$($p.Why)）：$($text.Trim())")
+                break
+            }
+        }
+    }
+    if ($offenders.Count -gt 0) {
+        $modeKeyHits += $offenders.Count
+        $show = @($offenders | Select-Object -First 8)
+        Add-Fail ("$($doc.Label) 把模式键写成了推荐用法（$($offenders.Count) 处，逐句列在下面）：" + [Environment]::NewLine + ($show -join [Environment]::NewLine))
+        if ($offenders.Count -gt 8) { Add-Info "……还有 $($offenders.Count - 8) 处（先修上面这些，改完再跑一次）" }
+    }
+}
+if ($modeKeyHits -eq 0) { Add-Ok "五份文档都没有把「按 Tab / 先按 Tab / 导航模式」写成推荐用法（历史说明已放行）" }
+
+# 2d. README「主要快捷键」附近必须有「无需模式键 / 不需要按任何模式键」声明。.
 if (-not (Test-Path -LiteralPath $readmePath)) {
     Add-Fail "缺少 README.md"
 } else {
@@ -239,46 +306,22 @@ if (-not (Test-Path -LiteralPath $readmePath)) {
     if (-not $sec.Found) {
         Add-Fail "README.md 里找不到「## 主要快捷键」一节（快捷键表是发布文档的固定结构）"
     } else {
-        $tabLines = @($sec.Lines | Where-Object { $_ -match 'Tab' })
-        if ($tabLines.Count -eq 0) {
-            Add-Ok "README 主要快捷键一节没有 Tab 行（Tab 不进推荐表，符合遗留处置）"
+        $headIdx = -1
+        for ($i = 0; $i -lt $readmeLines.Count; $i++) {
+            if ($readmeLines[$i] -match '^##\s*主要快捷键') { $headIdx = $i; break }
+        }
+        $ctxStart = [Math]::Max(0, $headIdx - 8)
+        $ctxEnd = $headIdx + $sec.Lines.Count - 1
+        $nearLines = @($readmeLines[$ctxStart..$ctxEnd])
+        $declRe = '无需模式键|不需要模式键|不需要按任何模式键|无需按任何模式键|不用按任何模式键|无模式键|没有模式键|不用模式键|不需要先按|不需要按.{0,8}模式键|无需按.{0,8}模式键'
+        $decl = @($nearLines | Where-Object { $_ -match $declRe })
+        if ($decl.Count -eq 0) {
+            Add-Fail "README.md 的「## 主要快捷键」附近没有声明「无需模式键 / 不需要按任何模式键」（0.2.0.0 起界面操作无模式键）"
         } else {
-            $badTab = @($tabLines | Where-Object { $_ -notmatch '遗留|不提供|不得|历史|老作|不是推荐' })
-            if ($badTab.Count -gt 0) {
-                Add-Fail ("README 主要快捷键表里 Tab 行没有标「遗留」（Tab 导航模式不得当作推荐键）：" + [Environment]::NewLine + ($badTab -join [Environment]::NewLine))
-            } else {
-                Add-Ok "README 主要快捷键表的 Tab 行已标「遗留」/「不是推荐」"
-            }
+            Add-Ok "README「主要快捷键」附近已声明「无需模式键 / 不需要按任何模式键」"
         }
     }
 }
-
-# 2d. 安装说明 / 常见问题：Tab 模式不得写成推荐。.
-function Test-TabNotRecommended([string]$path, [string]$label) {
-    if (-not (Test-Path -LiteralPath $path)) {
-        Add-Fail "缺少 $label（发布包根目录的手写文档，P7 交付）"
-        return
-    }
-    $lines = [IO.File]::ReadAllLines($path, [Text.Encoding]::UTF8)
-    $tabLines = @($lines | Where-Object { $_ -match 'Tab' })
-    if ($tabLines.Count -eq 0) {
-        Add-Ok "$label 没有 Tab 导航模式说明（填「不提供」也可以）"
-        return
-    }
-    $framesLegacy = ((($lines -join "`n") -match '遗留|不提供|不是推荐|不得|历史|老作|已移除'))
-    if (-not $framesLegacy) {
-        Add-Fail "$label 提到了 Tab 但没有标「遗留/不提供/不是推荐」—— 不能把 Tab 导航模式写成推荐"
-        return
-    }
-    $bad = @($tabLines | Where-Object { ($_ -match '推荐|建议|默认|首选') -and ($_ -notmatch '遗留|不提供|不是推荐|不得|历史|老作|已移除') })
-    if ($bad.Count -gt 0) {
-        Add-Fail ("$label 把 Tab 导航模式写成了推荐/默认：" + [Environment]::NewLine + ($bad -join [Environment]::NewLine))
-    } else {
-        Add-Ok "$label 没有把 Tab 导航模式写成推荐"
-    }
-}
-Test-TabNotRecommended (Join-Path $root 'mod\package\安装说明.md') 'mod\package\安装说明.md'
-Test-TabNotRecommended (Join-Path $root 'mod\package\常见问题.md') 'mod\package\常见问题.md'
 
 # 2e. 版本三处一致：README 当前版本 / CHANGELOG 顶部标题 / dist 最新包名。.
 $changelogPath = Join-Path $root 'CHANGELOG.md'
