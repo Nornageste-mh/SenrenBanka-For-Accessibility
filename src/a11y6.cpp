@@ -1405,7 +1405,7 @@ static const char *kScanScript =
 	"\"chvolume\",\"sysvovolume\",\"bgv2volume\"];"
 	"var LQ=[root];var XQ=[0];var YQ=[0];var DQ=[0];var GQ=[0];"
 	"var A1=[0];var A2=[0];var A3=[1920];var A4=[1080];var PQ=[\"\"];"
-	"var RQ=[];var FQ=[];"
+	"var RQ=[];var FQ=[];var LQ2=[];var NQ=[];var CXQ=[];var CYQ=[];"
 	"for(var qi=0;qi<LQ.length&&qi<1200;qi++){"
 	"var l=LQ[qi];var ax=XQ[qi];var ay=YQ[qi];var d=DQ[qi];"
 	"var c1=A1[qi];var c2=A2[qi];var c3=A3[qi];var c4=A4[qi];"
@@ -1453,6 +1453,7 @@ static const char *kScanScript =
 	"var ccx=mx+ww/2;var ccy=my+hh/2;"
 	"if(ccx>=n1&&ccx<=n3&&ccy>=n2&&ccy<=n4&&ccx>=0&&ccy>=0&&ccx<=1920&&ccy<=1080){"
 	"RQ.push(\"B\"+can+en+\"\\t\"+n+\"\\t\"+ccx+\",\"+ccy+\",\"+ww+\",\"+hh+\"\\t\"+PQ[qi]+\"|\");FQ.push(ud);"
+	"LQ2.push(l);NQ.push(n);CXQ.push(ccx);CYQ.push(ccy);"
 	"}}}"
 	// 收掉 if(ev==1){ 的括号：原先少一个右花括号，整段脚本解析失败（scan 永远空）。
 	"}"
@@ -1469,8 +1470,47 @@ static const char *kScanScript =
 	"}"
 	"}"
 	"}"
-	"if(dlg==1){for(var ri=0;ri<RQ.length;ri++){if(FQ[ri]==1)r+=RQ[ri];}}"
-	"else{for(var rj=0;rj<RQ.length;rj++){r+=RQ[rj];}}"
+	// 遮挡判定（实机：设置界面打开后仍能导航到下层标题按钮）：对每个候选的绝对
+	// 中心调游戏自己的 getPrimaryLayerAt 取最顶层，再沿 parent 往上找候选层本身；
+	// 找不到说明被上层界面盖住，丢弃。命中为空/异常时保守保留（宁可多收不可漏收）。
+	"var r=\"\";var OQ=[];var kept=0;"
+	"for(var ri=0;ri<RQ.length;ri++){"
+	"var keep=1;var bad=0;var tp=null;"
+	"var hxq=Math.floor(CXQ[ri]);var hyq=Math.floor(CYQ[ri]);"
+	"try{tp=k.getPrimaryLayerAt(hxq,hyq);}catch(eh){bad=1;}"
+	"if(bad==0&&tp!=null){"
+	"var found=0;var bad2=0;var pp=tp;"
+	"for(var pzi=0;pzi<16;pzi++){"
+	"if(pp==null)break;"
+	"if(pp==LQ2[ri]){found=1;break;}"
+	"var npp=null;try{npp=pp.parent;}catch(ep){bad2=1;npp=null;}"
+	"if(bad2==1)break;"
+	"pp=npp;"
+	"}"
+	"if(found==0&&bad2==0){"
+	// 放宽条件 B（实机：存读档槽位的命中点是其祖先 ParentHackLayer）：
+	// 从候选层自己向上走，若命中层是它的祖先，说明命中点就是它自己的容器，
+	// 并没有别的界面盖住它 → 保留。A/B 都不满足才判被遮挡。
+	"var found2=0;var bad3=0;var qq=LQ2[ri];"
+	"for(var pzj=0;pzj<16;pzj++){"
+	"if(qq==null)break;"
+	"if(qq==tp){found2=1;break;}"
+	"var nqq=null;try{nqq=qq.parent;}catch(ep2){bad3=1;nqq=null;}"
+	"if(bad3==1)break;"
+	"qq=nqq;"
+	"}"
+	"if(found2==0&&bad3==0)keep=0;"
+	"}"
+	"}"
+	"if(keep==1){if(dlg==0||FQ[ri]==1){r+=RQ[ri];kept++;}}"
+	"else{OQ.push(\"O\\t\"+NQ[ri]+\"\\t\"+CXQ[ri]+\",\"+CYQ[ri]+\"|\");}"
+	"}"
+	// 安全阀：若一条都没保留，说明 getPrimaryLayerAt/对象相等在这台机器上不可靠，
+	// 保守回退为全保留 —— 遮挡判错最多多收几项，绝不能把整个界面导航清空。
+	"if(kept==0&&RQ.length>0){"
+	"for(var rj2=0;rj2<RQ.length;rj2++){if(dlg==0||FQ[rj2]==1)r+=RQ[rj2];}"
+	"}"
+	"for(var oi=0;oi<OQ.length;oi++)r+=OQ[oi];"
 	"return \"F\"+bk+cv+dlg+\"|\"+r;";
 
 // 层名 → 中文标签。每条的依据都写在注释里（层名来自探针转储，中文来自界面截图核对）。
@@ -2217,6 +2257,21 @@ static void ScanItems(void)
 	{
 		char *bar = strchr(p, '|');
 		if(bar) *bar = 0;
+#ifdef A11Y_DEV
+		// 被遮挡丢弃的候选（release 不解析、不出这些字符串）：O\t<层名>\t<x>,<y>
+		if(p[0] == 'O' && p[1] == '\t')
+		{
+			char *onm = p + 2;
+			char *otab = strchr(onm, '\t');
+			if(otab)
+			{
+				*otab = 0;
+				double ox = 0, oy = 0;
+				if(sscanf_s(otab + 1, "%lf,%lf", &ox, &oy) == 2)
+					diagf("occluded: %s @%d,%d\n", onm, (int)(ox + 0.5), (int)(oy + 0.5));
+			}
+		}
+#endif
 		// 形如  B<can><en>\t<层名>\t<x>,<y>,<w>,<h>\t<层路径>
 		if(p[0] == 'B' && p[1] && p[2] && p[3] == '\t')
 		{
@@ -2391,7 +2446,9 @@ static void ScanItems(void)
 		if(strcmp(firstKey, g_prevFirstKey) != 0)
 		{
 			g_sel = -1;
-			g_lastAnnounced[0] = 0;   // 上一屏的重读缓存也一起作废
+			// 重读缓存不清：它的生命周期只跟「朗读内容」走。有配音的台词按设计只写
+			// g_lastAnnounced、不朗读（PollDialogue 的 voiced 分支），若这里随界面
+			// 抖动清掉，Backspace 就再也没法重读那一句了（实机 bug）。
 		}
 		strcpy_s(g_prevFirstKey, firstKey);
 	}
@@ -2989,6 +3046,10 @@ static bool NavKeyDown(WPARAM vk, bool repeat)
 
 	if(vk == VK_BACK)
 	{
+#ifdef A11Y_DEV
+		diagf("repeat req: sel=%d cache=%d len=%d\n", g_sel,
+			g_lastAnnounced[0] ? 1 : 0, (int)wcslen(g_lastAnnounced));
+#endif
 		if(g_sel >= 0) NavAnnounce(NULL);
 		else if(g_lastAnnounced[0]) SpeechSpeak(g_lastAnnounced, true);
 		else SpeechSpeak(Ph(P_NOTHING_READ), true);
