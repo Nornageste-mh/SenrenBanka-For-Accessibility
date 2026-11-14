@@ -1169,15 +1169,44 @@ static void PollDialogue(void)
 		if(!text[0] || (tk && !pk)) chosen = plain;
 	}
 	if(!chosen[0]) return;
-	if(wcscmp(chosen, g_lastText) == 0 && wcscmp(name, g_lastName) == 0) return;
-	wcscpy_s(g_lastName, 256, name);
-	wcscpy_s(g_lastText, 4096, chosen);
 
+	// 先去尾空白再当去重键（0.2.0.1 实机热修：同一句概率性被念两遍）：
+	// 原始 chosen 的尾部空白在不同轮询间会变（渲染文本打字完成后才补上 "\n"），
+	// 而真正朗读的是裁剪后的 line；拿未裁剪的串做去重键就会漏判，同一句念两次。
 	wchar_t line[4096];
 	wcsncpy_s(line, 4096, chosen, _TRUNCATE);
 	size_t tl = wcslen(line);
-	while(tl > 0 && (line[tl-1] == L'\n' || line[tl-1] == L'\r' || line[tl-1] == L' ')) line[--tl] = 0;
+	while(tl > 0 && (line[tl-1] == L'\n' || line[tl-1] == L'\r' ||
+	                 line[tl-1] == L' ' || line[tl-1] == (wchar_t)0x3000)) line[--tl] = 0;
 	if(!line[0]) return;
+
+	// 名字同样去尾空白再比较；朗读分支仍用原 name（行为不变）。
+	wchar_t nameTrim[256];
+	wcsncpy_s(nameTrim, 256, name, _TRUNCATE);
+	size_t nl = wcslen(nameTrim);
+	while(nl > 0 && (nameTrim[nl-1] == L'\n' || nameTrim[nl-1] == L'\r' ||
+	                 nameTrim[nl-1] == L' ' || nameTrim[nl-1] == (wchar_t)0x3000)) nameTrim[--nl] = 0;
+
+	if(wcscmp(line, g_lastText) == 0 && wcscmp(nameTrim, g_lastName) == 0)
+	{
+#ifdef A11Y_DEV
+		// 根因诊断（发布构建不编译）：裁剪后与上次相同、但原始串不同 —— 旧去重键会漏判。
+		if(wcscmp(chosen, g_lastText) != 0 || wcscmp(name, g_lastName) != 0)
+		{
+			size_t pl = wcslen(g_lastText), cl = wcslen(chosen);
+			unsigned int p1 = 0, p2 = 0, n1 = 0, n2 = 0;
+			if(pl >= 2) { p1 = (unsigned int)g_lastText[pl-2]; p2 = (unsigned int)g_lastText[pl-1]; }
+			else if(pl == 1) p1 = (unsigned int)g_lastText[0];
+			if(cl >= 2) { n1 = (unsigned int)chosen[cl-2]; n2 = (unsigned int)chosen[cl-1]; }
+			else if(cl == 1) n1 = (unsigned int)chosen[0];
+			diagf("dedupe-raw-diff: prevLen=%d newLen=%d prevTail=%04X,%04X newTail=%04X,%04X nameEq=%d\n",
+				(int)pl, (int)cl, p1, p2, n1, n2, (wcscmp(name, g_lastName) == 0) ? 1 : 0);
+		}
+#endif
+		return;
+	}
+	wcscpy_s(g_lastName, 256, nameTrim);
+	wcscpy_s(g_lastText, 4096, line);
 
 	if(g_choiceCount > 0)
 	{
